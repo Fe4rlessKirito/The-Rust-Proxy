@@ -1,0 +1,5 @@
+https://www.torproject.org/download/tor/
+
+download Windows (x86_64)	15.0.17 (tor 0.4.9.11) (sig)
+
+only put tor.exe in here
