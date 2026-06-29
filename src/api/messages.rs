@@ -37,7 +37,7 @@ pub struct AnthropicRequest {
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
-    pub system: Option<String>,
+    pub system: Option<serde_json::Value>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
     #[serde(default)]
@@ -63,6 +63,32 @@ fn tools_prompt(tools: &[serde_json::Value], tool_choice: Option<&serde_json::Va
         prompt.push_str(&choice.to_string());
     }
     prompt
+}
+
+fn anthropic_system_to_string(system: &serde_json::Value) -> String {
+    match system {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(_) => item
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        serde_json::Value::Object(_) => system
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| system.to_string()),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 fn convert_anthropic_content(content: Option<&serde_json::Value>) -> serde_json::Value {
@@ -187,8 +213,11 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
     let mut openai_messages = Vec::new();
 
     let mut system_parts = Vec::new();
-    if let Some(system) = req.system {
-        system_parts.push(system);
+    if let Some(system) = req.system.as_ref() {
+        let system = anthropic_system_to_string(system);
+        if !system.is_empty() {
+            system_parts.push(system);
+        }
     }
     if tools_enabled {
         system_parts.push(tools_prompt(&tools, req.tool_choice.as_ref()));
