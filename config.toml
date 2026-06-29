@@ -1,0 +1,30 @@
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[direct]
+auth_base = "https://api.use.ai/v1/auth"
+ws_agent_base = "wss://agents.use.ai/agents/budget-agent"
+model_prefix = "gateway-"
+ws_open_timeout_sec = 30
+ws_idle_timeout_sec = 90
+direct_ws_retries = 2
+direct_max_concurrency = 24
+
+[account_pool]
+size = 100
+ttl_sec = 1800
+refill_sec = 5
+signup_delay_ms = 1000
+
+[proxy]
+# You can keep socks5_url for a single proxy (optional)
+# socks5_url = "socks5h://127.0.0.1:9050"
+tor_ports = [9050, 9051, 9052]
+tor_instances = 3
+
+[models]
+default = "gpt-5-4"
+
+[thinking]
+levels = { low = 1024, medium = 5000, high = 16000, max = 32000 }
