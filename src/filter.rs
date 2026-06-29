@@ -62,9 +62,19 @@ impl InjectionFilter {
                     }
                 } else {
                     if self.buf.len() > TAG_GUARD {
-                        let safe = self.buf[..self.buf.len() - TAG_GUARD].to_string();
+                        let safe_len = self
+                            .buf
+                            .char_indices()
+                            .map(|(idx, _)| idx)
+                            .filter(|idx| self.buf.len() - idx > TAG_GUARD)
+                            .last()
+                            .unwrap_or(0);
+                        let safe = self.buf[..safe_len].to_string();
                         out.push_str(&safe);
-                        self.buf = self.buf.split_off(self.buf.len() - TAG_GUARD);
+                        self.buf = self.buf.split_off(safe_len);
+                    } else if !self.buf.contains('<') {
+                        out.push_str(&self.buf);
+                        self.buf.clear();
                     }
                     break;
                 }

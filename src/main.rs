@@ -93,11 +93,13 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = api::create_routes(pool.clone(), load_monitor, tor_manager.clone()).layer(cors);
+    let app =
+        api::create_routes(pool.clone(), load_monitor, tor_manager.clone(), cfg.clone()).layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], cfg.server.port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Server listening on http://{}", addr);
+    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let local_addr: SocketAddr = listener.local_addr()?;
+    info!("Server listening on http://{}", local_addr);
 
     let server = axum::serve(listener, app);
 

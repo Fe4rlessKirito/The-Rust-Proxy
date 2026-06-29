@@ -18,6 +18,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::account_pool::AccountPool;
+use crate::config::Config;
 use crate::load_monitor::LoadMonitor;
 use crate::tor_manager::TorManager;
 
@@ -34,6 +35,7 @@ pub fn create_routes(
     pool: AccountPool,
     load_monitor: LoadMonitor,
     tor_manager: Arc<TorManager>,
+    config: Config,
 ) -> Router {
     Router::new()
         .nest("/v1", chat::routes())
@@ -45,5 +47,6 @@ pub fn create_routes(
         .layer(from_fn(record_request))
         .layer(Extension(load_monitor))
         .layer(Extension(tor_manager))
+        .layer(Extension(config))
         .with_state(pool)
 }

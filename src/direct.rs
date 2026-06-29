@@ -1,6 +1,7 @@
 //! Headless WebSocket account creation and streaming.
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use futures::{SinkExt, StreamExt};
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::Client;
@@ -21,6 +22,167 @@ use crate::utils::{gen_email, now_secs};
 use tracing::{debug, error, info, warn};
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
+
+// ---------- File upload helper ----------
+
+/// Upload a file (base64 encoded) to files.use.ai and return the public URL.
+async fn upload_file_to_files(
+    base64_data: &str,
+    filename: &str,
+    proxy_url: Option<&str>,
+) -> Result<String> {
+    let raw_data = general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| anyhow!("Invalid base64: {}", e))?;
+    let media_type = guess_media_type(filename, Some(&raw_data));
+
+    upload_bytes_to_files(raw_data, filename, &media_type, proxy_url).await
+}
+
+async fn upload_bytes_to_files(
+    raw_data: Vec<u8>,
+    filename: &str,
+    media_type: &str,
+    proxy_url: Option<&str>,
+) -> Result<String> {
+    let media_type = if media_type.is_empty() {
+        guess_media_type(filename, Some(&raw_data))
+    } else {
+        media_type.to_string()
+    };
+
+    let client_builder = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(USER_AGENT)
+        .no_proxy();
+
+    let client = if let Some(url) = proxy_url {
+        client_builder.proxy(reqwest::Proxy::all(url)?).build()?
+    } else {
+        client_builder.build()?
+    };
+
+    let part = reqwest::multipart::Part::bytes(raw_data)
+        .file_name(filename.to_string())
+        .mime_str(&media_type)?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("name", filename.to_string())
+        .text("type", media_type);
+
+    let resp = client
+        .post("https://files.use.ai/upload")
+        .multipart(form)
+        .header("Origin", "https://use.ai")
+        .header("Referer", "https://use.ai/")
+        .send()
+        .await
+        .map_err(|e| anyhow!("Upload request failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Upload failed: {} - {}", status, text);
+    }
+
+    let data: Value = resp.json().await?;
+    let file_url = data["url"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Upload response missing 'url'"))?;
+    let full_url = if file_url.starts_with('/') {
+        format!("https://files.use.ai{}", file_url)
+    } else {
+        file_url.to_string()
+    };
+
+    info!("Uploaded file: {}", full_url);
+    Ok(full_url)
+}
+
+async fn upload_remote_image_to_files(
+    image_url: &str,
+    filename: &str,
+    proxy_url: Option<&str>,
+) -> Result<(String, String)> {
+    let client_builder = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(USER_AGENT)
+        .no_proxy();
+
+    let client = if let Some(url) = proxy_url {
+        client_builder.proxy(reqwest::Proxy::all(url)?).build()?
+    } else {
+        client_builder.build()?
+    };
+
+    let resp = client
+        .get(image_url)
+        .header("Accept", "image/*,*/*;q=0.8")
+        .send()
+        .await
+        .map_err(|e| anyhow!("Image download failed: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Image download failed: {} - {}", status, text);
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| value.starts_with("image/"))
+        .map(ToOwned::to_owned);
+    let bytes = resp.bytes().await?.to_vec();
+    let media_type = content_type.unwrap_or_else(|| guess_media_type(filename, Some(&bytes)));
+    let uploaded_url = upload_bytes_to_files(bytes, filename, &media_type, proxy_url).await?;
+
+    Ok((uploaded_url, media_type))
+}
+
+fn is_image_media_type(media_type: &str) -> bool {
+    media_type.starts_with("image/")
+}
+
+fn guess_media_type(filename: &str, content: Option<&[u8]>) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "gif" => "image/gif".to_string(),
+        "webp" => "image/webp".to_string(),
+        "avif" => "image/avif".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        "docx" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string()
+        }
+        "doc" => "application/msword".to_string(),
+        "txt" => "text/plain".to_string(),
+        "csv" => "text/csv".to_string(),
+        _ => {
+            if let Some(bytes) = content {
+                if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                    return "image/png".to_string();
+                }
+                if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                    return "image/jpeg".to_string();
+                }
+                if bytes.starts_with(&[0x47, 0x49, 0x46, 0x38]) {
+                    return "image/gif".to_string();
+                }
+                if bytes.starts_with(&[0x52, 0x49, 0x46, 0x46]) {
+                    return "image/webp".to_string();
+                }
+                if bytes.starts_with(&[0x25, 0x50, 0x44, 0x46]) {
+                    return "application/pdf".to_string();
+                }
+            }
+            "application/octet-stream".to_string()
+        }
+    }
+}
 
 // ---------- Account creation ----------
 
@@ -94,7 +256,7 @@ fn build_client_with_jar(proxy_url: Option<&str>) -> Result<(Client, Arc<Jar>)> 
 async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
     let (client, jar) = build_client_with_jar(proxy_url)?;
     let email = gen_email();
-    let cfg = Config::default();
+    let cfg = Config::load().unwrap_or_default();
     let auth_base = cfg.direct.auth_base;
 
     // 1. email-login
@@ -231,42 +393,263 @@ fn parse_socks5_proxy(proxy: &str) -> Result<(&str, u16)> {
     Ok((host, port.parse::<u16>()?))
 }
 
-// ---------- Streaming completion ----------
+// ---------- Structured content parsing ----------
 
-fn build_frame(
+fn data_uri_parts(value: &str) -> Option<(&str, &str)> {
+    let (header, data) = value.split_once(',')?;
+    if header.starts_with("data:") {
+        Some((header, data))
+    } else {
+        None
+    }
+}
+
+fn media_type_from_data_uri_header(header: &str, fallback: &str) -> String {
+    header
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split(';').next())
+        .filter(|media_type| !media_type.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+async fn file_part_from_data_or_url(
+    data_or_url: &str,
+    filename: &str,
+    explicit_media_type: Option<&str>,
+    proxy_url: Option<&str>,
+) -> Result<Value> {
+    let guessed_media_type = explicit_media_type
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| guess_media_type(filename, None));
+
+    let (url, media_type) = if let Some((header, base64_data)) = data_uri_parts(data_or_url) {
+        let media_type = media_type_from_data_uri_header(&header, &guessed_media_type);
+        let url = upload_file_to_files(base64_data, filename, proxy_url).await?;
+        (url, media_type)
+    } else if data_or_url.starts_with("http://") || data_or_url.starts_with("https://") {
+        if is_image_media_type(&guessed_media_type) {
+            upload_remote_image_to_files(data_or_url, filename, proxy_url).await?
+        } else {
+            (data_or_url.to_string(), guessed_media_type)
+        }
+    } else {
+        let url = upload_file_to_files(data_or_url, filename, proxy_url).await?;
+        (url, guessed_media_type)
+    };
+
+    Ok(json!({
+        "type": "file",
+        "mediaType": media_type,
+        "url": url,
+        "filename": filename,
+    }))
+}
+
+async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> Result<Vec<Value>> {
+    let mut parts = Vec::new();
+
+    match content {
+        Value::String(text) => {
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    parts.push(json!({ "type": "text", "text": text }));
+                }
+            }
+
+            if let Some(image_data) = obj.get("image").and_then(|v| v.as_str()) {
+                let filename = obj
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image.png");
+                let media_type = obj.get("media_type").and_then(|v| v.as_str());
+                parts.push(
+                    file_part_from_data_or_url(image_data, filename, media_type, proxy_url).await?,
+                );
+            }
+
+            if let Some(file_url) = obj.get("file_url").and_then(|v| v.as_str()) {
+                let filename = obj
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("file");
+                let media_type = obj.get("media_type").and_then(|v| v.as_str());
+                parts.push(
+                    file_part_from_data_or_url(file_url, filename, media_type, proxy_url).await?,
+                );
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                let Some(obj) = item.as_object() else {
+                    warn!("Skipping non-object item in content array");
+                    continue;
+                };
+
+                match obj.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                parts.push(json!({ "type": "text", "text": text }));
+                            }
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(url) = obj
+                            .get("image_url")
+                            .and_then(|v| v.get("url"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let filename = obj
+                                .get("filename")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("image.png");
+                            parts.push(
+                                file_part_from_data_or_url(url, filename, None, proxy_url).await?,
+                            );
+                        }
+                    }
+                    Some("file") => {
+                        if let Some(file_obj) = obj.get("file").and_then(|v| v.as_object()) {
+                            let filename = file_obj
+                                .get("filename")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| obj.get("filename").and_then(|v| v.as_str()))
+                                .unwrap_or("file");
+                            let media_type = file_obj
+                                .get("media_type")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| obj.get("media_type").and_then(|v| v.as_str()));
+
+                            if let Some(url) = file_obj.get("url").and_then(|v| v.as_str()) {
+                                parts.push(
+                                    file_part_from_data_or_url(url, filename, media_type, proxy_url)
+                                        .await?,
+                                );
+                            } else if let Some(data) =
+                                file_obj.get("data").and_then(|v| v.as_str())
+                            {
+                                parts.push(
+                                    file_part_from_data_or_url(
+                                        data, filename, media_type, proxy_url,
+                                    )
+                                    .await?,
+                                );
+                            }
+                        } else if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+                            let filename = obj
+                                .get("filename")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("file");
+                            let media_type = obj.get("media_type").and_then(|v| v.as_str());
+                            parts.push(
+                                file_part_from_data_or_url(url, filename, media_type, proxy_url)
+                                    .await?,
+                            );
+                        }
+                    }
+                    _ => {
+                        if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+                            let filename = obj
+                                .get("filename")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("file");
+                            let media_type = obj.get("media_type").and_then(|v| v.as_str());
+                            parts.push(
+                                file_part_from_data_or_url(url, filename, media_type, proxy_url)
+                                    .await?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => warn!("Unsupported content type: {:?}", content),
+    }
+
+    if parts.is_empty() {
+        parts.push(json!({ "type": "text", "text": "" }));
+    }
+
+    Ok(parts)
+}
+
+async fn build_frame(
     chat_id: &str,
     account: &Account,
     model: &str,
     messages: &[Value],
     model_prefix: &str,
-) -> Value {
+    proxy_url: Option<&str>,
+) -> Result<Value> {
     let model_slug = resolve_model(model);
     let selected_model = format!("{}{}", model_prefix, model_slug);
 
-    let mut parts = Vec::new();
-    for msg in messages {
-        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+    let has_structured_content = messages.iter().any(|msg| {
+        matches!(
+            msg.get("content"),
+            Some(Value::Object(_)) | Some(Value::Array(_))
+        )
+    });
+
+    let mut use_messages = Vec::new();
+
+    if !has_structured_content {
+        let mut parts = Vec::new();
+        for msg in messages {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                parts.push(json!({
+                    "type": "text",
+                    "text": content,
+                }));
+            }
+        }
+
+        if parts.is_empty() {
             parts.push(json!({
                 "type": "text",
-                "text": content,
+                "text": "Hello",
+            }));
+        }
+
+        use_messages.push(json!({
+            "id": uuid::Uuid::new_v4().simple().to_string(),
+            "role": "user",
+            "parts": parts,
+            "metadata": {},
+        }));
+    } else {
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let parts = match msg.get("content") {
+                Some(content) => build_parts_from_content(content, proxy_url).await?,
+                None => vec![json!({ "type": "text", "text": "" })],
+            };
+
+            use_messages.push(json!({
+                "id": uuid::Uuid::new_v4().simple().to_string(),
+                "role": role,
+                "parts": parts,
+                "metadata": {},
+            }));
+        }
+
+        if use_messages.is_empty() {
+            use_messages.push(json!({
+                "id": uuid::Uuid::new_v4().simple().to_string(),
+                "role": "user",
+                "parts": [{ "type": "text", "text": "" }],
+                "metadata": {},
             }));
         }
     }
-    if parts.is_empty() {
-        parts.push(json!({
-            "type": "text",
-            "text": "Hello",
-        }));
-    }
 
-    let use_messages = vec![json!({
-        "id": uuid::Uuid::new_v4().simple().to_string(),
-        "role": "user",
-        "parts": parts,
-        "metadata": {},
-    })];
-
-    json!({
+    Ok(json!({
         "chatId": chat_id,
         "userId": account.user_id,
         "email": account.email,
@@ -294,8 +677,10 @@ fn build_frame(
         "messages": use_messages,
         "trigger": "submit-message",
         "source": "chat_page",
-    })
+    }))
 }
+
+// ---------- Streaming completion ----------
 
 pub async fn stream_completion(
     model: &str,
@@ -305,7 +690,7 @@ pub async fn stream_completion(
 ) -> impl futures::Stream<Item = Result<String>> {
     use futures::stream::{self, BoxStream};
 
-    let cfg = Config::default();
+    let cfg = Config::load().unwrap_or_default();
     let chat_id = uuid::Uuid::new_v4().to_string();
     let uri = format!(
         "{}/{chat_id}?userId={}&userType=regular&userEmail={}&planType=free&isTestUser=false",
@@ -333,7 +718,15 @@ pub async fn stream_completion(
         let mut ws_stream =
             connect_websocket_with_proxy(&uri, proxy_url.as_deref(), open_timeout).await?;
 
-        let frame = build_frame(&chat_id, &account, &model, &messages, &model_prefix);
+        let frame = build_frame(
+            &chat_id,
+            &account,
+            &model,
+            &messages,
+            &model_prefix,
+            proxy_url.as_deref(),
+        )
+        .await?;
         ws_stream.send(Message::Text(frame.to_string())).await?;
 
         let mut filter = InjectionFilter::new();
@@ -388,14 +781,22 @@ pub async fn stream_completion(
     }
 
     let mut last_err = None;
+    let mut attempts = Vec::new();
     for _ in 1..=retries {
+        attempts.push(proxy_url.map(String::from));
+    }
+    if proxy_url.is_some() {
+        attempts.push(None);
+    }
+
+    for attempt_proxy in attempts {
         match attempt(
             uri.clone(),
             chat_id.clone(),
             account.clone(),
             model.to_string(),
             messages.to_vec(),
-            proxy_url.map(String::from),
+            attempt_proxy,
             model_prefix.clone(),
             open_timeout,
             idle_timeout,
