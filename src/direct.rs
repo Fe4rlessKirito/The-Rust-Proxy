@@ -313,6 +313,14 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         error!("get-session failed: {} - {}", status, text);
         anyhow::bail!("get-session failed: {} - {}", status, text);
     }
+    // NEW: read the JWT from headers
+    let jwt = resp
+        .headers()
+        .get("set-auth-jwt")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
     let body: Value = resp.json().await?;
     let user_id = body["user"]["id"]
         .as_str()
@@ -330,7 +338,7 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         email,
         user_id,
         cookie_header,
-        token: "".to_string(),
+        token: jwt,
         born: now_secs(),
     })
 }
@@ -693,10 +701,11 @@ pub async fn stream_completion(
     let cfg = Config::load().unwrap_or_default();
     let chat_id = uuid::Uuid::new_v4().to_string();
     let uri = format!(
-        "{}/{chat_id}?userId={}&userType=regular&userEmail={}&planType=free&isTestUser=false",
+        "{}/{chat_id}?userId={}&userType=regular&userEmail={}&planType=free&isTestUser=false&token={}",
         cfg.direct.ws_agent_base,
         account.user_id,
         account.email,
+        account.token,
     );
 
     let open_timeout = Duration::from_secs(cfg.direct.ws_open_timeout_sec);
