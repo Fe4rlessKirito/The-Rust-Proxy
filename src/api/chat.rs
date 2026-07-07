@@ -7,103 +7,70 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use serde_json::Value;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::debug;
+
+use super::format::{parse_thinking, split_stream_text};
+use super::tools::{
+    has_trusted_tool_prompt, is_tool_call_incomplete, looks_like_tool_call, looks_like_tool_prompt,
+    looks_like_tool_refusal, mark_trusted_tool_prompt, normalize_tool_messages,
+    normalize_tools_for_prompt, parse_tool_uses, tool_choice_to_prompt_value, tools_prompt,
+    ToolModeStreamBuffer,
+};
 
 use crate::account_pool::AccountPool;
-use crate::direct::{complete_completion, stream_completion};
 use crate::models::resolve_model;
 use crate::pool::acquire_direct_permit;
+use crate::providers::{
+    complete_completion, proxy_url_for_model, requires_use_ai_account, stream_completion,
+    CompletionRequest,
+};
 
-const STREAM_CHUNK_CHARS: usize = 32;
-const TOOL_PROMPT: &str = r#"You may be given tools. If a tool is needed, do not answer with prose. Instead output exactly one tool call in this format:
-
-<tool_use>
-{"name":"tool_name","input":{"key":"value"}}
-</tool_use>
-
-After a tool result is provided, answer the user normally or request another tool with the same format."#;
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ChatRequest {
     pub model: String,
-    pub messages: Vec<serde_json::Value>,
+    pub messages: Vec<Value>,
+    #[serde(default)]
+    pub user: Option<String>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub thinking: Option<ThinkingParam>,
     #[serde(default)]
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub tools: Option<Vec<Value>>,
     #[serde(default)]
-    pub tool_choice: Option<serde_json::Value>,
+    pub tool_choice: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ThinkingParam {
     Bool(bool),
     Level(String),
-    Object { type_: String, budget_tokens: usize },
+    Object {
+        #[serde(rename = "type")]
+        type_: String,
+        #[serde(default)]
+        budget_tokens: Option<usize>,
+    },
 }
 
 pub fn routes() -> axum::Router<AccountPool> {
-    axum::Router::new().route("/chat/completions", axum::routing::post(handler))
+    axum::Router::new().route("/chat/completions", axum::routing::post(chat_handler))
 }
 
-fn tools_prompt(tools: &[serde_json::Value], tool_choice: Option<&serde_json::Value>) -> String {
-    let mut prompt = String::from(TOOL_PROMPT);
-    prompt.push_str("\n\nAvailable tools:\n");
-    prompt.push_str(
-        &serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string()),
-    );
-    if let Some(choice) = tool_choice {
-        prompt.push_str("\n\nTool choice:\n");
-        prompt.push_str(&choice.to_string());
-    }
-    prompt
+fn chat_session_id(req: &ChatRequest) -> String {
+    req.user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string()
 }
 
-fn parse_tool_use(reply: &str) -> Option<(String, serde_json::Value)> {
-    let value = extract_tagged_json(reply, "tool_use")?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let input = value
-        .get("input")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some((name, input))
-}
-
-fn extract_tagged_json(reply: &str, tag: &str) -> Option<serde_json::Value> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = reply.find(&open)? + open.len();
-    let end = reply[start..].find(&close)? + start;
-    let body = reply[start..end].trim();
-    serde_json::from_str::<serde_json::Value>(body).ok()
-}
-
-fn normalize_tool_messages(messages: &mut [serde_json::Value]) {
-    for msg in messages {
-        if msg.get("role").and_then(|v| v.as_str()) == Some("tool") {
-            let tool_call_id = msg
-                .get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let content = msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| msg.get("content").map(|v| v.to_string()))
-                .unwrap_or_default();
-            *msg = serde_json::json!({
-                "role": "user",
-                "content": format!("Tool result for {}:\n{}", tool_call_id, content),
-            });
-        }
-    }
-}
-
-async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) -> Response {
+async fn chat_handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) -> Response {
     let permit = match acquire_direct_permit().await {
         Ok(p) => p,
         Err(e) => {
@@ -115,68 +82,112 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
     };
 
     let model = resolve_model(&req.model);
+    let session_id = chat_session_id(&req);
+    if crate::usage::cap_exceeded(&session_id) {
+        return Json(serde_json::json!({
+            "error": format!("Usage cap reached for session '{}'", session_id)
+        }))
+        .into_response();
+    }
 
-    let (thinking_enabled, _budget) = match req.thinking {
-        Some(ThinkingParam::Bool(b)) => (b, 1024),
+    let thinking_requested = match req.thinking {
+        Some(ThinkingParam::Bool(b)) => b,
         Some(ThinkingParam::Level(level)) => {
             let cfg = crate::config::Config::load().unwrap_or_default();
-            let budget = cfg.thinking.levels.get(&level).copied().unwrap_or(1024);
-            (true, budget)
+            let _budget = cfg.thinking.levels.get(&level).copied().unwrap_or(1024);
+            true
         }
         Some(ThinkingParam::Object {
             type_,
             budget_tokens,
-        }) => (type_ == "enabled", budget_tokens),
-        None => (false, 1024),
+        }) => {
+            let _budget = budget_tokens.unwrap_or(1024);
+            type_ == "enabled"
+        }
+        None => false,
     };
 
-    let tools = req.tools.clone().unwrap_or_default();
+    let raw_tools = req.tools.clone().unwrap_or_default();
+    let tools = normalize_tools_for_prompt(&raw_tools);
     let tools_enabled = !tools.is_empty();
+    debug!(
+        "Incoming request (responses API): {} tools present, tools_enabled={}, message_count={}",
+        raw_tools.len(),
+        tools_enabled,
+        req.messages.len()
+    );
+    let tool_choice = tool_choice_to_prompt_value(req.tool_choice.as_ref());
     let mut messages = req.messages;
     normalize_tool_messages(&mut messages);
 
-    let mut injected_prompts = Vec::new();
     if tools_enabled {
-        injected_prompts.push(tools_prompt(&tools, req.tool_choice.as_ref()));
-    }
-    if thinking_enabled {
-        injected_prompts.push("Before you answer, reason step by step. Format your response exactly as:\n\n<thinking>\nYour reasoning here.\n</thinking>\n\n<response>\nYour final answer here.\n</response>".to_string());
-    }
-
-    if !injected_prompts.is_empty() {
-        let injected_prompt = injected_prompts.join("\n\n");
-        let system_msg = serde_json::json!({
-            "role": "system",
-            "content": injected_prompt,
-        });
-
-        if let Some(first) = messages.first_mut() {
-            if first.get("role") == Some(&"system".into()) {
-                if let Some(content) = first.get_mut("content") {
-                    if let Some(s) = content.as_str() {
-                        *content =
-                            serde_json::Value::String(format!("{}\n\n{}", s, injected_prompt));
-                    }
+        messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": tools_prompt(&tools, tool_choice.as_ref()),
+                "metadata": {
+                    "leech_proxy_tool_prompt": true
                 }
+            }),
+        );
+    } else {
+        messages.retain_mut(|message| {
+            if message.get("role").and_then(|v| v.as_str()) == Some("system") {
+                if message
+                    .get("content")
+                    .map(looks_like_tool_prompt)
+                    .unwrap_or(false)
+                {
+                    tracing::debug!(
+                        "Preserving inbound tool-like system prompt as trusted proxy prompt"
+                    );
+                    mark_trusted_tool_prompt(message);
+                    return true;
+                }
+
+                tracing::debug!(
+                    "Dropping chat system message before direct completion: {}",
+                    message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<non-string>")
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                );
+                false
             } else {
-                messages.insert(0, system_msg);
+                true
             }
-        } else {
-            messages.push(system_msg);
-        }
+        });
     }
 
-    let account = match pool.acquire().await {
-        Ok(acc) => acc,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("Failed to acquire account: {}", e)
-            }))
-            .into_response();
+    let input_tokens = crate::usage::estimate_messages_tokens(&messages);
+
+    let tool_mode_expected = tools_enabled || has_trusted_tool_prompt(&messages);
+    debug!(
+        "chat tool mode summary: explicit_tools={}, trusted_prompt_present={}, tool_mode_expected={}",
+        tools_enabled,
+        has_trusted_tool_prompt(&messages),
+        tool_mode_expected
+    );
+
+    let account = if requires_use_ai_account(&model) {
+        match pool.acquire().await {
+            Ok(acc) => Some(acc),
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "error": format!("Failed to acquire account: {}", e)
+                }))
+                .into_response();
+            }
         }
+    } else {
+        None
     };
 
-    let proxy_url = pool.next_proxy().await;
+    let proxy_url = proxy_url_for_model(&model, &pool).await;
 
     if req.stream {
         // Generate a chat completion ID and timestamp (shared for all chunks)
@@ -205,22 +216,39 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
             });
             yield Ok::<_, Infallible>(Event::default().data(role_chunk.to_string()));
 
-            let mut stream = stream_completion(
-                &model,
-                &messages,
-                proxy_url.as_deref(),
-                account,
-            )
-            .await;
+            let mut stream = stream_completion(CompletionRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                proxy_url: proxy_url.clone(),
+                account: account.clone(),
+            }).await;
 
             let mut buffered_reply = String::new();
+            let mut tool_buffer = ToolModeStreamBuffer::default();
+            let mut stream_failed = false;
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(text) => {
-                        if tools_enabled {
-                            buffered_reply.push_str(&text);
+                        if tool_mode_expected {
+                            for text_part in tool_buffer.push(&text) {
+                                let chunk_obj = serde_json::json!({
+                                    "id": id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_clone,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": text_part,
+                                        },
+                                        "finish_reason": null,
+                                    }]
+                                });
+                                yield Ok::<_, Infallible>(Event::default().data(chunk_obj.to_string()));
+                            }
                             continue;
                         }
+                        buffered_reply.push_str(&text);
                         for text_part in split_stream_text(&text) {
                             let mut delta = serde_json::Map::new();
                             delta.insert("content".to_string(), serde_json::Value::String(text_part));
@@ -240,6 +268,26 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
                         }
                     }
                     Err(e) => {
+                        stream_failed = true;
+                        if tool_mode_expected {
+                            for text_part in tool_buffer.push(&format!("[ERROR] {}", e)) {
+                                let error_chunk = serde_json::json!({
+                                    "id": id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_clone,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": text_part
+                                        },
+                                        "finish_reason": null,
+                                    }]
+                                });
+                                yield Ok(Event::default().data(error_chunk.to_string()));
+                            }
+                            break;
+                        }
                         let error_chunk = serde_json::json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -259,48 +307,100 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
                 }
             }
 
-            if tools_enabled {
-                if let Some((name, input)) = parse_tool_use(&buffered_reply) {
-                    let tool_call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                    let tool_call_chunk = serde_json::json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_clone,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": tool_call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input.to_string(),
-                                    }
-                                }]
-                            },
-                            "finish_reason": null,
-                        }]
-                    });
-                    yield Ok::<_, Infallible>(Event::default().data(tool_call_chunk.to_string()));
-                    let final_chunk = serde_json::json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_clone,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls",
-                        }]
-                    });
-                    yield Ok::<_, Infallible>(Event::default().data(final_chunk.to_string()));
-                    yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
-                    return;
+            if tool_mode_expected {
+                let (finished_reply, held_text) = tool_buffer.finish();
+                buffered_reply = finished_reply;
+                if !stream_failed {
+                    let parsed_calls = parse_tool_uses(&buffered_reply);
+                    if !parsed_calls.is_empty() {
+                        let _ = crate::usage::record_tokens(
+                            &session_id,
+                            &model,
+                            input_tokens,
+                            crate::usage::estimate_tokens(&buffered_reply),
+                        );
+                        let tool_call_ids = parsed_calls
+                            .iter()
+                            .map(|_| format!("call_{}", uuid::Uuid::new_v4().simple()))
+                            .collect::<Vec<_>>();
+                        let name_chunk = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_clone,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": parsed_calls.iter().enumerate().map(|(idx, (name, _))| serde_json::json!({
+                                        "index": idx,
+                                        "id": tool_call_ids[idx],
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": "",
+                                        }
+                                    })).collect::<Vec<_>>()
+                                },
+                                "finish_reason": null,
+                            }]
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(name_chunk.to_string()));
+
+                        for (idx, (_, input)) in parsed_calls.iter().enumerate() {
+                            let arguments = input.to_string();
+                            for arg_part in split_stream_text(&arguments) {
+                                let arg_chunk = serde_json::json!({
+                                    "id": id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_clone,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": idx,
+                                                "function": {
+                                                    "arguments": arg_part,
+                                                }
+                                            }]
+                                        },
+                                        "finish_reason": null,
+                                    }]
+                                });
+                                yield Ok::<_, Infallible>(Event::default().data(arg_chunk.to_string()));
+                            }
+                        }
+
+                        let final_chunk = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_clone,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "tool_calls",
+                            }]
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(final_chunk.to_string()));
+                        yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+                        return;
+                    }
+
+                    if is_tool_call_incomplete(&buffered_reply) {
+                        debug!("Incomplete tool call from upstream, raw reply: {}", buffered_reply);
+                    }
+
+                    if looks_like_tool_call(&buffered_reply) {
+                        debug!("Unconvertible tool call from upstream, raw reply: {}", buffered_reply);
+                    }
+
+                    if looks_like_tool_refusal(&buffered_reply) {
+                        debug!("Upstream refused tool usage, raw reply: {}", buffered_reply);
+                    }
                 }
 
-                for text_part in split_stream_text(&buffered_reply) {
+                for text_part in held_text {
                     let chunk_obj = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -317,6 +417,13 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
                     yield Ok::<_, Infallible>(Event::default().data(chunk_obj.to_string()));
                 }
             }
+
+            let _ = crate::usage::record_tokens(
+                &session_id,
+                &model,
+                input_tokens,
+                crate::usage::estimate_tokens(&buffered_reply),
+            );
 
             let final_chunk = serde_json::json!({
                 "id": id,
@@ -337,10 +444,24 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
         Sse::new(sse_stream).into_response()
     } else {
         // Non-streaming (unchanged)
-        match complete_completion(&model, &messages, proxy_url.as_deref(), account).await {
+        match complete_completion(CompletionRequest {
+            model: model.clone(),
+            messages: messages.clone(),
+            proxy_url: proxy_url.clone(),
+            account: account.clone(),
+        })
+        .await
+        {
             Ok(reply) => {
-                if tools_enabled {
-                    if let Some((name, input)) = parse_tool_use(&reply) {
+                let _ = crate::usage::record_tokens(
+                    &session_id,
+                    &model,
+                    input_tokens,
+                    crate::usage::estimate_tokens(&reply),
+                );
+                if tool_mode_expected {
+                    let parsed_calls = parse_tool_uses(&reply);
+                    if !parsed_calls.is_empty() {
                         let json_reply = serde_json::json!({
                             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
                             "object": "chat.completion",
@@ -351,27 +472,39 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
                                 "message": {
                                     "role": "assistant",
                                     "content": null,
-                                    "tool_calls": [{
+                                    "tool_calls": parsed_calls.iter().map(|(name, input)| serde_json::json!({
                                         "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
                                         "type": "function",
                                         "function": {
                                             "name": name,
                                             "arguments": input.to_string(),
                                         }
-                                    }]
+                                    })).collect::<Vec<_>>()
                                 },
                                 "finish_reason": "tool_calls",
                             }],
                         });
                         return Json(json_reply).into_response();
                     }
+                    if looks_like_tool_call(&reply) {
+                        debug!(
+                            "Tool-like reply leaked past conversion in non-stream path. raw reply: {}",
+                            reply
+                        );
+                        return Json(serde_json::json!({
+                            "error": "Tool call was detected but could not be converted safely"
+                        }))
+                        .into_response();
+                    }
+                    if looks_like_tool_refusal(&reply) {
+                        debug!("Upstream refused tool usage, raw reply: {}", reply);
+                        // Fall through to the normal completion below instead of
+                        // returning a synthetic error -- see streaming handler for
+                        // why (poisons later turns if the client stores/replays it).
+                    }
                 }
 
-                let (thinking, response) = if thinking_enabled {
-                    parse_thinking(&reply)
-                } else {
-                    (None, reply)
-                };
+                let (thinking, response) = parse_thinking(&reply);
                 let mut json_reply = serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
                     "object": "chat.completion",
@@ -386,8 +519,10 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
                         "finish_reason": "stop",
                     }],
                 });
-                if let Some(t) = thinking {
-                    json_reply["thinking"] = serde_json::Value::String(t);
+                if thinking_requested {
+                    if let Some(t) = thinking {
+                        json_reply["thinking"] = serde_json::Value::String(t);
+                    }
                 }
                 Json(json_reply).into_response()
             }
@@ -399,37 +534,22 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<ChatRequest>) 
     }
 }
 
-/// Parse `<thinking>...</thinking>` and `<response>...</response>` from reply.
-fn parse_thinking(reply: &str) -> (Option<String>, String) {
-    let thinking_re = regex::Regex::new(r"(?s)<thinking>(.*?)</thinking>").unwrap();
-    let response_re = regex::Regex::new(r"(?s)<response>(.*?)</response>").unwrap();
-    let thinking = thinking_re
-        .captures(reply)
-        .map(|cap| cap[1].trim().to_string());
-    let response = response_re
-        .captures(reply)
-        .map(|cap| cap[1].trim().to_string())
-        .unwrap_or_else(|| reply.trim().to_string());
-    (thinking, response)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn split_stream_text(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
+    #[test]
+    fn chat_session_id_uses_user_when_present() {
+        let req = ChatRequest {
+            model: "gpt-5-4".to_string(),
+            messages: vec![],
+            user: Some("session-123".to_string()),
+            stream: false,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        assert_eq!(chat_session_id(&req), "session-123");
     }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        current.push(ch);
-        if current.chars().count() >= STREAM_CHUNK_CHARS {
-            chunks.push(std::mem::take(&mut current));
-        }
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
-    chunks
 }

@@ -9,7 +9,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Web framework
 axum = { version = "0.7", features = ["multipart"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -23,7 +23,7 @@ config = { version = "0.14", features = ["toml"] }
 dotenvy = "0.15"
 
 # HTTP & WebSocket clients
-reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "rustls-tls", "cookies", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "rustls-tls", "cookies", "multipart", "stream"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 tungstenite = "0.24"
 futures = "0.3"
@@ -40,7 +40,11 @@ once_cell = "1.19"
 lazy_static = "1.4"
 mime = "0.3"
 which = "6.0"
+scraper = "0.20"
 
 # Error handling
 anyhow = "1"
 thiserror = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

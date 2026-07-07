@@ -2,8 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -11,8 +9,10 @@ pub struct Config {
     pub direct: DirectConfig,
     pub account_pool: AccountPoolConfig,
     pub proxy: ProxyConfig,
+    pub provider_proxies: ProviderProxyConfig,
     pub models: ModelsConfig,
     pub thinking: ThinkingConfig,
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -42,9 +42,16 @@ pub struct AccountPoolConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProxyConfig {
-    pub socks5_url: Option<String>,      // kept for backward compatibility
-    pub tor_ports: Vec<u16>,             // list of ports to run Tor on
-    pub tor_instances: usize,            // number of Tor instances to spawn (if ports not specified)
+    pub socks5_url: Option<String>, // kept for backward compatibility
+    pub tor_ports: Vec<u16>,        // list of ports to run Tor on
+    pub tor_instances: usize,       // number of Tor instances to spawn (if ports not specified)
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProviderProxyConfig {
+    pub use_ai_ports: Vec<u16>,
+    pub sakana_ports: Vec<u16>,
+    pub faceb_ports: Vec<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -55,6 +62,13 @@ pub struct ModelsConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ThinkingConfig {
     pub levels: HashMap<String, usize>,
+    pub expose_tool_thinking: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub debug_protocol: bool,
 }
 
 impl Default for Config {
@@ -84,10 +98,16 @@ impl Default for Config {
                 tor_ports: vec![9050, 9051, 9052],
                 tor_instances: 3,
             },
+            provider_proxies: ProviderProxyConfig {
+                use_ai_ports: (9050..=9060).collect(),
+                sakana_ports: (9061..=9070).collect(),
+                faceb_ports: (9071..=9080).collect(),
+            },
             models: ModelsConfig {
                 default: "gpt-5-4".into(),
             },
             thinking: ThinkingConfig {
+                expose_tool_thinking: true,
                 levels: [
                     ("low".into(), 1024),
                     ("medium".into(), 5000),
@@ -97,6 +117,10 @@ impl Default for Config {
                 .into_iter()
                 .collect(),
             },
+            logging: LoggingConfig {
+                level: "info".into(),
+                debug_protocol: false,
+            },
         }
     }
 }
@@ -104,16 +128,10 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Result<Self, config::ConfigError> {
         let builder = config::Config::builder()
+            .add_source(config::Config::try_from(&Config::default())?)
             .add_source(config::File::with_name("config").required(false))
             .add_source(config::Environment::with_prefix("LEECH").separator("__"))
             .build()?;
         builder.try_deserialize()
-    }
-
-    pub fn save(&self) -> Result<(), anyhow::Error> {
-        let toml_str = toml::to_string_pretty(self)?;
-        let path = PathBuf::from("config.toml");
-        fs::write(path, toml_str)?;
-        Ok(())
     }
 }

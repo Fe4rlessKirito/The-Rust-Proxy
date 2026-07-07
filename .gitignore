@@ -1,0 +1,36 @@
+# Ignore everything by default
+*
+
+# Allow this ignore file
+!.gitignore
+
+# Allow directories so whitelist rules can reach files inside them
+!*/
+
+# Keep Rust source code
+!src/**
+
+# Keep frontend source code and project files
+!frontend/src/**
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+
+# Keep Cargo manifest
+!Cargo.toml
+
+# Keep config
+!config.toml
+!config/**
+
+# Keep bundled Tor files, but not runtime Tor data
+!tor/**
+
+tor_data_*/
+.leech-rs/
+src/.leech-rs/
+
+# Always ignore build output and dependencies
+target/
+frontend/node_modules/
+frontend/dist/

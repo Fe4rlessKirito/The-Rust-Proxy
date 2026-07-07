@@ -1,16 +1,17 @@
-//! Concurrency limiting for the headless WebSocket path.
+//! Concurrency cap for the direct headless path.
 
 use std::sync::Arc;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Global semaphore for direct WebSocket requests.
-/// Its limit is controlled by `direct_max_concurrency` in config.
-pub static DIRECT_SEM: once_cell::sync::Lazy<Arc<Semaphore>> = once_cell::sync::Lazy::new(|| {
-    let cfg = crate::config::Config::load().unwrap_or_default();
-    Arc::new(Semaphore::new(cfg.direct.direct_max_concurrency))
-});
+lazy_static::lazy_static! {
+    static ref DIRECT_SEM: Arc<Semaphore> = Arc::new(Semaphore::new(
+        std::env::var("DIRECT_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24)
+    ));
+}
 
-/// Acquire a permit for a direct request. The permit is released when dropped.
-pub async fn acquire_direct_permit() -> Result<SemaphorePermit<'static>, tokio::sync::AcquireError> {
-    DIRECT_SEM.acquire().await
+pub async fn acquire_direct_permit() -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    DIRECT_SEM.clone().acquire_owned().await
 }

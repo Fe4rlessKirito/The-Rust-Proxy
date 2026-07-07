@@ -9,10 +9,18 @@ use futures::StreamExt;
 use serde::Deserialize;
 use std::convert::Infallible;
 
+use super::tools::{
+    has_trusted_tool_prompt, looks_like_tool_call, looks_like_tool_prompt, looks_like_tool_refusal,
+    normalize_tools_for_prompt, parse_tool_uses, tool_choice_to_prompt_value, tools_prompt,
+    ToolModeStreamBuffer,
+};
 use crate::account_pool::AccountPool;
-use crate::direct::{complete_completion, stream_completion};
 use crate::models::resolve_model;
 use crate::pool::acquire_direct_permit;
+use crate::providers::{
+    complete_completion, proxy_url_for_model, requires_use_ai_account, stream_completion,
+    CompletionRequest,
+};
 
 // Thinking level to budget (same as chat.rs)
 const THINKING_LEVELS: &[(&str, usize)] = &[
@@ -21,19 +29,12 @@ const THINKING_LEVELS: &[(&str, usize)] = &[
     ("high", 16000),
     ("max", 32000),
 ];
-
-const TOOL_PROMPT: &str = r#"You may be given tools. If a tool is needed, do not answer with prose. Instead output exactly one tool call in this format:
-
-<tool_use>
-{"name":"tool_name","input":{"key":"value"}}
-</tool_use>
-
-After a tool result is provided, answer the user normally or request another tool with the same format."#;
-
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
     pub model: String,
     pub messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -41,56 +42,57 @@ pub struct AnthropicRequest {
     #[serde(default)]
     pub max_tokens: Option<usize>,
     #[serde(default)]
-    pub thinking: Option<bool>,
+    pub thinking: Option<ThinkingParam>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ThinkingParam {
+    Bool(bool),
+    Level(String),
+    Object {
+        #[serde(rename = "type")]
+        type_: String,
+        #[serde(default)]
+        budget_tokens: Option<usize>,
+    },
+}
+
 pub fn routes() -> axum::Router<AccountPool> {
     axum::Router::new().route("/messages", axum::routing::post(handler))
 }
 
-fn tools_prompt(tools: &[serde_json::Value], tool_choice: Option<&serde_json::Value>) -> String {
-    let mut prompt = String::from(TOOL_PROMPT);
-    prompt.push_str("\n\nAvailable tools:\n");
-    prompt.push_str(
-        &serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string()),
-    );
-    if let Some(choice) = tool_choice {
-        prompt.push_str("\n\nTool choice:\n");
-        prompt.push_str(&choice.to_string());
-    }
-    prompt
+fn anthropic_session_id(req: &AnthropicRequest) -> String {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.get("session_id").or_else(|| m.get("user_id")))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string()
 }
 
-fn anthropic_system_to_string(system: &serde_json::Value) -> String {
-    match system {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| match item {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(_) => item
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                _ => None,
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        serde_json::Value::Object(_) => system
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| system.to_string()),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    }
+fn summarize_anthropic_messages(messages: &[serde_json::Value]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+            let content = msg
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let preview = content.to_string().chars().take(80).collect::<String>();
+            format!("{}:{}:{}", idx, role, preview)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
-
 fn convert_anthropic_content(content: Option<&serde_json::Value>) -> serde_json::Value {
     match content {
         Some(serde_json::Value::String(s)) => serde_json::Value::String(s.clone()),
@@ -119,6 +121,55 @@ fn convert_anthropic_content(content: Option<&serde_json::Value>) -> serde_json:
                             "filename": "image.png",
                         }))
                     }
+                    Some("document") | Some("file") => {
+                        let filename = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item.get("filename").and_then(|v| v.as_str()))
+                            .unwrap_or("file");
+                        if let Some(source) = item.get("source").and_then(|v| v.as_object()) {
+                            let media_type = source
+                                .get("media_type")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| item.get("media_type").and_then(|v| v.as_str()))
+                                .unwrap_or("application/octet-stream");
+                            if let Some(data) = source.get("data").and_then(|v| v.as_str()) {
+                                Some(serde_json::json!({
+                                    "type": "file",
+                                    "file": {
+                                        "data": format!("data:{};base64,{}", media_type, data),
+                                        "filename": filename,
+                                        "media_type": media_type,
+                                    }
+                                }))
+                            } else {
+                                source.get("url").and_then(|v| v.as_str()).map(|url| {
+                                    serde_json::json!({
+                                        "type": "file",
+                                        "file": {
+                                            "url": url,
+                                            "filename": filename,
+                                            "media_type": media_type,
+                                        }
+                                    })
+                                })
+                            }
+                        } else {
+                            item.get("url").and_then(|v| v.as_str()).map(|url| {
+                                serde_json::json!({
+                                    "type": "file",
+                                    "file": {
+                                        "url": url,
+                                        "filename": filename,
+                                        "media_type": item
+                                            .get("media_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("application/octet-stream"),
+                                    }
+                                })
+                            })
+                        }
+                    }
                     Some("tool_result") => {
                         let tool_use_id = item
                             .get("tool_use_id")
@@ -134,18 +185,33 @@ fn convert_anthropic_content(content: Option<&serde_json::Value>) -> serde_json:
                             .unwrap_or_default();
                         Some(serde_json::json!({
                             "type": "text",
-                            "text": format!("Tool result for {}:\n{}", tool_use_id, result_content),
+                            "text": format!(
+                                "Tool result for {} has completed. Continue the user's task using this result:\n{}",
+                                tool_use_id,
+                                result_content
+                            ),
                         }))
                     }
                     Some("tool_use") => {
-                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-                        let input = item.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let input = item
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
                         Some(serde_json::json!({
                             "type": "text",
-                            "text": format!("Assistant requested tool {} with input: {}", name, input),
+                            "text": format!(
+                                "<tool_use>\n{}\n</tool_use>",
+                                serde_json::json!({
+                                    "name": name,
+                                    "input": input
+                                })
+                            ),
                         }))
                     }
-                    Some("file") => Some(item.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -154,25 +220,6 @@ fn convert_anthropic_content(content: Option<&serde_json::Value>) -> serde_json:
         Some(other) => other.clone(),
         None => serde_json::Value::String(String::new()),
     }
-}
-
-fn parse_tool_use(reply: &str) -> Option<(String, serde_json::Value)> {
-    let value = extract_tagged_json(reply, "tool_use")?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let input = value
-        .get("input")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    Some((name, input))
-}
-
-fn extract_tagged_json(reply: &str, tag: &str) -> Option<serde_json::Value> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = reply.find(&open)? + open.len();
-    let end = reply[start..].find(&close)? + start;
-    let body = reply[start..end].trim();
-    serde_json::from_str::<serde_json::Value>(body).ok()
 }
 
 fn truncate_to_token_budget(text: String, max_tokens: Option<usize>) -> String {
@@ -204,29 +251,77 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
             .into_response();
         }
     };
+    let session_id = anthropic_session_id(&req);
+    if crate::usage::cap_exceeded(&session_id) {
+        return Json(serde_json::json!({
+            "error": format!("Usage cap reached for session '{}'", session_id)
+        }))
+        .into_response();
+    }
 
-    let thinking_enabled = req.thinking.unwrap_or(false);
-    let tools = req.tools.clone().unwrap_or_default();
+    let thinking_requested = match req.thinking {
+        Some(ThinkingParam::Bool(enabled)) => enabled,
+        Some(ThinkingParam::Level(level)) => {
+            let _budget = THINKING_LEVELS
+                .iter()
+                .find(|(k, _)| *k == level)
+                .map(|(_, v)| *v);
+            true
+        }
+        Some(ThinkingParam::Object {
+            type_,
+            budget_tokens,
+        }) => {
+            let _budget = budget_tokens;
+            type_ == "enabled"
+        }
+        None => false,
+    };
+    let raw_tools = req.tools.clone().unwrap_or_default();
+    let tools = normalize_tools_for_prompt(&raw_tools);
     let tools_enabled = !tools.is_empty();
+    let tool_choice = tool_choice_to_prompt_value(req.tool_choice.as_ref());
+    tracing::debug!(
+        "anthropic request summary: model={}, stream={}, tools_enabled={}, raw_tools={}, tool_choice_present={}, system_present={}, messages={}",
+        req.model,
+        req.stream,
+        tools_enabled,
+        raw_tools.len(),
+        tool_choice.is_some(),
+        req.system.is_some(),
+        summarize_anthropic_messages(&req.messages)
+    );
 
     // Convert Anthropic messages to OpenAI format
     let mut openai_messages = Vec::new();
 
-    let mut system_parts = Vec::new();
-    if let Some(system) = req.system.as_ref() {
-        let system = anthropic_system_to_string(system);
-        if !system.is_empty() {
-            system_parts.push(system);
-        }
-    }
     if tools_enabled {
-        system_parts.push(tools_prompt(&tools, req.tool_choice.as_ref()));
-    }
-    if !system_parts.is_empty() {
         openai_messages.push(serde_json::json!({
             "role": "system",
-            "content": system_parts.join("\n\n"),
+            "content": tools_prompt(&tools, tool_choice.as_ref()),
+            "metadata": {
+                "leech_proxy_tool_prompt": true
+            }
         }));
+    } else if let Some(system) = req.system.as_ref() {
+        if looks_like_tool_prompt(system) {
+            tracing::debug!(
+                "Preserving Anthropic tool-like system field as trusted proxy prompt: {}",
+                system.to_string()
+            );
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": system,
+                "metadata": {
+                    "leech_proxy_tool_prompt": true
+                }
+            }));
+        } else {
+            tracing::debug!(
+                "Dropping Anthropic system field before upstream frame: {}",
+                system.to_string()
+            );
+        }
     }
 
     for msg in req.messages {
@@ -237,74 +332,43 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
             "content": content,
         }));
     }
-
-    // --- INJECT THINKING PROMPT ---
-    if thinking_enabled {
-        let level = "medium";
-        let _budget = THINKING_LEVELS
-            .iter()
-            .find(|(k, _)| *k == level)
-            .map(|(_, v)| *v)
-            .unwrap_or(1024);
-        let depth = match level {
-            "low" => "briefly",
-            "medium" => "step by step",
-            "high" => "thoroughly, exploring multiple angles",
-            "max" => "exhaustively, considering all possible angles and edge cases",
-            _ => "step by step",
-        };
-        let thinking_prompt = format!(
-            "Before you answer, reason {}. Format your response exactly as:\n\n\
-            <thinking>\nYour reasoning here.\n</thinking>\n\n\
-            <response>\nYour final answer here.\n</response>",
-            depth
-        );
-
-        if let Some(first) = openai_messages.first_mut() {
-            if first.get("role") == Some(&"system".into()) {
-                if let Some(content) = first.get_mut("content") {
-                    if let Some(s) = content.as_str() {
-                        *content =
-                            serde_json::Value::String(format!("{}\n\n{}", s, thinking_prompt));
-                    }
-                }
-            } else {
-                openai_messages.insert(
-                    0,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": thinking_prompt,
-                    }),
-                );
-            }
-        } else {
-            openai_messages.push(serde_json::json!({
-                "role": "system",
-                "content": thinking_prompt,
-            }));
-        }
-    }
+    let tool_mode_expected = tools_enabled || has_trusted_tool_prompt(&openai_messages);
+    tracing::debug!(
+        "anthropic tool mode summary: explicit_tools={}, trusted_prompt_present={}, tool_mode_expected={}",
+        tools_enabled,
+        has_trusted_tool_prompt(&openai_messages),
+        tool_mode_expected
+    );
+    tracing::debug!(
+        "anthropic converted openai summary: {}",
+        summarize_anthropic_messages(&openai_messages)
+    );
+    let input_tokens = crate::usage::estimate_messages_tokens(&openai_messages);
 
     let model = resolve_model(&req.model);
 
-    let account = match pool.acquire().await {
-        Ok(acc) => acc,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("Failed to acquire account: {}", e)
-            }))
-            .into_response();
+    let account = if requires_use_ai_account(&model) {
+        match pool.acquire().await {
+            Ok(acc) => Some(acc),
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "error": format!("Failed to acquire account: {}", e)
+                }))
+                .into_response();
+            }
         }
+    } else {
+        None
     };
 
-    let proxy_url = pool.next_proxy().await;
+    let proxy_url = proxy_url_for_model(&model, &pool).await;
 
     // ---- STREAMING ----
     if req.stream {
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let model_clone = model.clone();
 
-        if tools_enabled {
+        if tool_mode_expected {
             let sse_stream = async_stream::stream! {
                 let start_event = serde_json::json!({
                     "type": "message_start",
@@ -328,17 +392,45 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                 });
                 yield Ok(axum::response::sse::Event::default().data(ping_event.to_string()));
 
-                let mut stream = stream_completion(
-                    &model,
-                    &openai_messages,
-                    proxy_url.as_deref(),
-                    account,
-                ).await;
-                let mut reply = String::new();
+                let text_block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "text",
+                        "text": "",
+                    }
+                });
+                let mut text_block_open = false;
+
+                let mut stream = stream_completion(CompletionRequest {
+                    model: model.clone(),
+                    messages: openai_messages.clone(),
+                    proxy_url: proxy_url.clone(),
+                    account: account.clone(),
+                }).await;
+                let mut tool_buffer = ToolModeStreamBuffer::default();
                 let mut stream_error = None;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
-                        Ok(text) => reply.push_str(&text),
+                        Ok(text) => {
+                            for text_part in tool_buffer.push(&text) {
+                                if !text_part.is_empty() {
+                                    if !text_block_open {
+                                        yield Ok(axum::response::sse::Event::default().data(text_block_start.to_string()));
+                                        text_block_open = true;
+                                    }
+                                    let delta = serde_json::json!({
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {
+                                            "type": "text_delta",
+                                            "text": text_part,
+                                        }
+                                    });
+                                    yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
+                                }
+                            }
+                        }
                         Err(e) => {
                             stream_error = Some(e.to_string());
                             break;
@@ -346,16 +438,13 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                     }
                 }
 
-                if let Some(error) = stream_error {
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "text",
-                            "text": "",
-                        }
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
+                let (reply, held_text) = tool_buffer.finish();
+
+                if let Some(error) = stream_error.as_ref() {
+                    if !text_block_open {
+                        yield Ok(axum::response::sse::Event::default().data(text_block_start.to_string()));
+                        text_block_open = true;
+                    }
                     let delta = serde_json::json!({
                         "type": "content_block_delta",
                         "index": 0,
@@ -365,76 +454,90 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                         }
                     });
                     yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
-                    let block_stop = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": 0,
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(block_stop.to_string()));
-                } else if let Some((name, input)) = parse_tool_use(&reply) {
-                    let tool_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": name,
-                            "input": {},
-                        }
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
-                    let input_json = input.to_string();
-                    let delta = serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": input_json,
-                        }
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
-                    let block_stop = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": 0,
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(block_stop.to_string()));
-                    let message_delta = serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": "tool_use",
-                            "stop_sequence": null,
-                        },
-                        "usage": {
-                            "output_tokens": 0,
-                        }
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(message_delta.to_string()));
                 } else {
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "text",
-                            "text": "",
+                    let parsed_calls = parse_tool_uses(&reply);
+                    if parsed_calls.is_empty() {
+                        for text_part in held_text {
+                            if !text_part.is_empty() {
+                                if !text_block_open {
+                                    yield Ok(axum::response::sse::Event::default().data(text_block_start.to_string()));
+                                    text_block_open = true;
+                                }
+                                let delta = serde_json::json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": text_part,
+                                    }
+                                });
+                                yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
+                            }
                         }
+                    }
+                    let _ = crate::usage::record_tokens(
+                        &session_id,
+                        &model,
+                        input_tokens,
+                        crate::usage::estimate_tokens(&reply),
+                    );
+                }
+
+                if text_block_open {
+                    let text_block_stop = serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": 0,
                     });
-                    yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
-                    if !reply.is_empty() {
-                        let delta = serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": 0,
+                    yield Ok(axum::response::sse::Event::default().data(text_block_stop.to_string()));
+                }
+
+                if stream_error.is_none() {
+                    let parsed_calls = parse_tool_uses(&reply);
+                    if !parsed_calls.is_empty() {
+                        for (idx, (name, input)) in parsed_calls.iter().enumerate() {
+                            let block_index = idx + 1;
+                            let tool_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                            let block_start = serde_json::json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": name,
+                                    "input": {},
+                                }
+                            });
+                            yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
+                            let input_json = input.to_string();
+                            for partial_json in input_json.as_bytes().chunks(32) {
+                                let delta = serde_json::json!({
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": String::from_utf8_lossy(partial_json),
+                                    }
+                                });
+                                yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
+                            }
+                            let block_stop = serde_json::json!({
+                                "type": "content_block_stop",
+                                "index": block_index,
+                            });
+                            yield Ok(axum::response::sse::Event::default().data(block_stop.to_string()));
+                        }
+                        let message_delta = serde_json::json!({
+                            "type": "message_delta",
                             "delta": {
-                                "type": "text_delta",
-                                "text": reply,
+                                "stop_reason": "tool_use",
+                                "stop_sequence": null,
+                            },
+                            "usage": {
+                                "output_tokens": 0,
                             }
                         });
-                        yield Ok(axum::response::sse::Event::default().data(delta.to_string()));
+                        yield Ok(axum::response::sse::Event::default().data(message_delta.to_string()));
                     }
-                    let block_stop = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": 0,
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(block_stop.to_string()));
                 }
 
                 let message_stop = serde_json::json!({
@@ -479,12 +582,12 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
             yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
 
             // 3. Stream text deltas, with thinking-aware splitting
-            let mut stream = stream_completion(
-                &model,
-                &openai_messages,
-                proxy_url.as_deref(),
-                account,
-            ).await;
+            let mut stream = stream_completion(CompletionRequest {
+                model: model.clone(),
+                messages: openai_messages.clone(),
+                proxy_url: proxy_url.clone(),
+                account: account.clone(),
+            }).await;
 
             // We'll use a state machine to split thinking and response
             let mut buffer = String::new();
@@ -692,22 +795,35 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
     }
 
     // ---- NON-STREAMING ----
-    let result = complete_completion(&model, &openai_messages, proxy_url.as_deref(), account).await;
+    let result = complete_completion(CompletionRequest {
+        model: model.clone(),
+        messages: openai_messages.clone(),
+        proxy_url: proxy_url.clone(),
+        account: account.clone(),
+    })
+    .await;
 
     match result {
         Ok(reply) => {
-            if tools_enabled {
-                if let Some((name, input)) = parse_tool_use(&reply) {
+            let _ = crate::usage::record_tokens(
+                &session_id,
+                &model,
+                input_tokens,
+                crate::usage::estimate_tokens(&reply),
+            );
+            if tool_mode_expected {
+                let parsed_calls = parse_tool_uses(&reply);
+                if !parsed_calls.is_empty() {
                     let resp = serde_json::json!({
                         "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
                         "type": "message",
                         "role": "assistant",
-                        "content": [{
+                        "content": parsed_calls.iter().map(|(name, input)| serde_json::json!({
                             "type": "tool_use",
                             "id": format!("toolu_{}", uuid::Uuid::new_v4().simple()),
                             "name": name,
                             "input": input,
-                        }],
+                        })).collect::<Vec<_>>(),
                         "model": model,
                         "stop_reason": "tool_use",
                         "stop_sequence": null,
@@ -718,13 +834,25 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                     });
                     return Json(resp).into_response();
                 }
+                if looks_like_tool_call(&reply) {
+                    tracing::debug!(
+                        "Tool-like Anthropic reply leaked past conversion in non-stream path. raw reply: {}",
+                        reply
+                    );
+                    return Json(serde_json::json!({
+                        "error": "Tool call was detected but could not be converted safely"
+                    }))
+                    .into_response();
+                }
+                if looks_like_tool_refusal(&reply) {
+                    tracing::debug!(
+                        "Upstream refused Anthropic tool usage, raw reply: {}",
+                        reply
+                    );
+                }
             }
 
-            let (thinking, response) = if thinking_enabled {
-                parse_thinking(&reply)
-            } else {
-                (None, reply)
-            };
+            let (thinking, response) = parse_thinking(&reply);
             let response = truncate_to_token_budget(response, req.max_tokens);
 
             let mut resp = serde_json::json!({
@@ -744,7 +872,7 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                 },
             });
 
-            if thinking_enabled {
+            if thinking_requested {
                 resp["thinking"] = thinking
                     .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null);
@@ -771,4 +899,88 @@ fn parse_thinking(reply: &str) -> (Option<String>, String) {
         .map(|cap| cap[1].trim().to_string())
         .unwrap_or_else(|| reply.trim().to_string());
     (thinking, response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_content_preserves_prior_tool_use_and_keeps_tool_result() {
+        let content = serde_json::json!([
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "Bash",
+                "input": {"command": "mkdir games"}
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "Created folders"
+            }
+        ]);
+
+        let converted = convert_anthropic_content(Some(&content));
+        let parts = converted.as_array().unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"].as_str().unwrap(), "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("<tool_use>"));
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"name\":\"Bash\""));
+        assert_eq!(parts[1]["type"].as_str().unwrap(), "text");
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Tool result for toolu_1 has completed"));
+    }
+
+    #[test]
+    fn anthropic_file_block_converts_to_internal_file_payload() {
+        let content = serde_json::json!([
+            {
+                "type": "file",
+                "name": "notes.txt",
+                "source": {
+                    "type": "base64",
+                    "media_type": "text/plain",
+                    "data": "aGVsbG8="
+                }
+            }
+        ]);
+
+        let converted = convert_anthropic_content(Some(&content));
+        let parts = converted.as_array().unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"].as_str().unwrap(), "file");
+        assert_eq!(parts[0]["file"]["filename"].as_str().unwrap(), "notes.txt");
+        assert!(parts[0]["file"]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:text/plain;base64,aGVsbG8="));
+    }
+
+    #[test]
+    fn anthropic_session_id_prefers_metadata_session_id() {
+        let req = AnthropicRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![],
+            metadata: Some(serde_json::json!({
+                "session_id": "session-123",
+                "user_id": "fallback-user"
+            })),
+            stream: false,
+            system: None,
+            max_tokens: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        assert_eq!(anthropic_session_id(&req), "session-123");
+    }
 }

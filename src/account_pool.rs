@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
@@ -14,11 +15,17 @@ use crate::tor_manager::TorManager;
 use crate::utils::now_secs;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Account {
     pub email: String,
     pub user_id: String,
     pub cookie_header: String,
     pub token: String,
+    /// The proxy this account was created through. Must be reused for
+    /// session refresh and the WS connection, because use.ai binds the
+    /// session to the signup IP. Connecting from a different IP causes
+    /// AUTH_REQUIRED (4001) on the agent WebSocket.
+    pub proxy_url: Option<String>,
     pub(crate) born: f64,
 }
 
@@ -41,17 +48,18 @@ pub struct AccountPool {
     signup_delay: Duration,
     running: Arc<Mutex<bool>>,
     semaphore: Arc<Semaphore>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl AccountPool {
-    pub async fn new(
+    pub async fn new_with_proxies(
         size: usize,
         ttl: Duration,
         tor_manager: Arc<TorManager>,
+        initial_proxies: Vec<String>,
         refill_sec: u64,
         signup_delay_ms: u64,
     ) -> Self {
-        let initial_proxies = tor_manager.get_proxies().await;
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(size))),
             size,
@@ -65,6 +73,7 @@ impl AccountPool {
             signup_delay: Duration::from_millis(signup_delay_ms),
             running: Arc::new(Mutex::new(false)),
             semaphore: Arc::new(Semaphore::new(32)),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -91,7 +100,7 @@ impl AccountPool {
 
         let mut rx = self.tor_manager.subscribe();
         let pool = self.clone();
-        tokio::spawn(async move {
+        let sync_handle = tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 let new_list = rx.borrow_and_update().clone();
                 let mut list = pool.proxy_list.lock().await;
@@ -99,15 +108,16 @@ impl AccountPool {
                 debug!("Updated dynamic proxy list: {:?}", *list);
             }
         });
+        self.tasks.lock().await.push(sync_handle);
 
         let pool = self.clone();
-        tokio::spawn(async move {
+        let refill_handle = tokio::spawn(async move {
             while *pool.running.lock().await {
                 let proxies = pool.proxies().await;
                 let signup_targets = if proxies.is_empty() {
                     vec![None]
                 } else {
-                    proxies.into_iter().map(Some).collect()
+                    proxies.into_iter().map(Some).collect::<Vec<_>>()
                 };
 
                 let current_len = pool.inner.lock().await.len();
@@ -120,7 +130,9 @@ impl AccountPool {
                         break;
                     }
 
-                    let proxy_key = proxy.clone().unwrap_or_else(|| "direct".to_string());
+                    let proxy_key = proxy
+                        .clone()
+                        .unwrap_or_else(|| format!("direct-{}", now_secs()));
                     {
                         let mut pending_proxies = pool.pending_proxies.lock().await;
                         if pending_proxies.contains(&proxy_key) {
@@ -134,10 +146,15 @@ impl AccountPool {
 
                     let permit = pool.semaphore.clone().acquire_owned().await.unwrap();
                     let pool = pool.clone();
-                    tokio::spawn(async move {
+                    let signup_handle = tokio::spawn(async move {
                         let _permit = permit;
                         debug!("Creating account with proxy: {:?}", proxy);
-                        if let Ok(acc) = create_account(proxy.as_deref()).await {
+                        let result = create_account(proxy.as_deref()).await;
+                        {
+                            pool.pending_proxies.lock().await.remove(&proxy_key);
+                            pool.pending_signups.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        if let Ok(acc) = result {
                             let mut inner = pool.inner.lock().await;
                             if inner.len() < pool.size {
                                 inner.push_back(acc);
@@ -146,9 +163,8 @@ impl AccountPool {
                         } else {
                             warn!("Failed to create account with proxy: {:?}", proxy);
                         }
-                        pool.pending_proxies.lock().await.remove(&proxy_key);
-                        pool.pending_signups.fetch_sub(1, Ordering::Relaxed);
                     });
+                    pool.tasks.lock().await.push(signup_handle);
                 }
 
                 let sleep_for = if was_full {
@@ -159,11 +175,18 @@ impl AccountPool {
                 time::sleep(sleep_for).await;
             }
         });
+        self.tasks.lock().await.push(refill_handle);
     }
 
     pub async fn stop(&self) {
         let mut guard = self.running.lock().await;
         *guard = false;
+        drop(guard);
+
+        let mut tasks = self.tasks.lock().await;
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
     }
 
     pub async fn acquire(&self) -> Result<Account> {
@@ -183,6 +206,14 @@ impl AccountPool {
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }
+
+    pub async fn set_proxies(&self, proxies: Vec<String>) {
+        *self.proxy_list.lock().await = proxies;
+    }
+
+    pub fn target_size(&self) -> usize {
+        self.size
+    }
 }
 
 impl Clone for AccountPool {
@@ -200,6 +231,7 @@ impl Clone for AccountPool {
             signup_delay: self.signup_delay,
             running: self.running.clone(),
             semaphore: self.semaphore.clone(),
+            tasks: self.tasks.clone(),
         }
     }
 }

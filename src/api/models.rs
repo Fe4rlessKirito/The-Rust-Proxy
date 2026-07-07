@@ -1,7 +1,7 @@
 //! /v1/models endpoint.
 
-use axum::{extract::State, response::Json, routing::get, Router};
 use crate::account_pool::AccountPool;
+use axum::{extract::State, response::Json, routing::get, Router};
 
 pub fn routes() -> Router<AccountPool> {
     Router::new().route("/models", get(handler))

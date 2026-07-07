@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::filter::InjectionFilter;
 use crate::models::resolve_model;
 use crate::utils::{gen_email, now_secs};
+use futures::stream::BoxStream;
 use tracing::{debug, error, info, warn};
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
@@ -192,11 +193,7 @@ pub async fn create_account(proxy_url: Option<&str>) -> Result<Account> {
 
     for (idx, proxy) in attempts.into_iter().enumerate() {
         let proxy_desc = proxy.unwrap_or("direct");
-        debug!(
-            "Account creation attempt {} using {}",
-            idx + 1,
-            proxy_desc
-        );
+        debug!("Account creation attempt {} using {}", idx + 1, proxy_desc);
 
         let mut retry_count = 0;
         while retry_count < 3 {
@@ -205,7 +202,10 @@ pub async fn create_account(proxy_url: Option<&str>) -> Result<Account> {
                 Err(e) => {
                     if is_rate_limit_error(&e) {
                         let wait = Duration::from_secs(2u64.pow(retry_count + 1));
-                        warn!("Received 429 using {}, waiting {:?} before retry", proxy_desc, wait);
+                        warn!(
+                            "Received 429 using {}, waiting {:?} before retry",
+                            proxy_desc, wait
+                        );
                         last_err = Some(e);
                         retry_count += 1;
                         tokio::time::sleep(wait).await;
@@ -238,10 +238,20 @@ fn is_rate_limit_error(err: &anyhow::Error) -> bool {
 
 fn build_client_with_jar(proxy_url: Option<&str>) -> Result<(Client, Arc<Jar>)> {
     let jar = Arc::new(Jar::default());
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert(
+        "Origin",
+        tungstenite::http::HeaderValue::from_static("https://use.ai"),
+    );
+    default_headers.insert(
+        "Referer",
+        tungstenite::http::HeaderValue::from_static("https://use.ai/"),
+    );
     let client_builder = Client::builder()
         .timeout(Duration::from_secs(30))
         .cookie_provider(jar.clone())
         .user_agent(USER_AGENT)
+        .default_headers(default_headers)
         .no_proxy();
 
     let client = if let Some(url) = proxy_url {
@@ -261,7 +271,7 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
 
     // 1. email-login
     let resp = client
-        .post(&format!("{}/email-login", auth_base))
+        .post(format!("{}/email-login", auth_base))
         .json(&json!({ "email": email }))
         .send()
         .await
@@ -278,7 +288,7 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
 
     // 2. sign-in/credentials
     let resp = client
-        .post(&format!("{}/sign-in/credentials", auth_base))
+        .post(format!("{}/sign-in/credentials", auth_base))
         .json(&json!({
             "email": email,
             "mixpanelUserId": uuid::Uuid::new_v4().to_string(),
@@ -297,10 +307,26 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         error!("sign-in/credentials failed: {} - {}", status, text);
         anyhow::bail!("sign-in/credentials failed: {} - {}", status, text);
     }
+    // Capture the short-lived JWT from the set-auth-jwt header. This is the
+    // worker auth token the browser sends as ?token=<JWT> on the WS URL.
+    let set_auth_jwt = resp
+        .headers()
+        .get("set-auth-jwt")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !set_auth_jwt.is_empty() {
+        debug!(
+            "sign-in/credentials returned set-auth-jwt: {}...",
+            &set_auth_jwt[..set_auth_jwt.len().min(16)]
+        );
+    }
+    // Consume the body so the connection can be reused for get-session.
+    let _ = resp.text().await;
 
     // 3. get-session
     let resp = client
-        .get(&format!("{}/get-session", auth_base))
+        .get(format!("{}/get-session", auth_base))
         .send()
         .await
         .map_err(|e| {
@@ -313,19 +339,51 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         error!("get-session failed: {} - {}", status, text);
         anyhow::bail!("get-session failed: {} - {}", status, text);
     }
-    // NEW: read the JWT from headers
-    let jwt = resp
-        .headers()
-        .get("set-auth-jwt")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-
     let body: Value = resp.json().await?;
     let user_id = body["user"]["id"]
         .as_str()
         .ok_or_else(|| anyhow!("user id not found"))?
         .to_string();
+
+    // The WS agent endpoint (agents.use.ai) authenticates via the session
+    // token. We capture both the JWT accessToken and the opaque session.token
+    // for experimentation. Currently trying the opaque token as Bearer since
+    // the JWT accessToken (alone, with cookie, with origin) all fail AUTH_REQUIRED.
+    let access_token_jwt = body["session"]["accessToken"]
+        .as_str()
+        .ok_or_else(|| anyhow!("session accessToken not found in get-session response"))?
+        .to_string();
+
+    let opaque_token = body["session"]["token"].as_str().unwrap_or("").to_string();
+
+    // Decode JWT header+payload for debugging (no signature verification).
+    debug!(
+        "accessToken JWT (first 80 chars): {}...",
+        &access_token_jwt[..access_token_jwt.len().min(80)]
+    );
+    if !opaque_token.is_empty() {
+        debug!(
+            "session.token (opaque): {}...",
+            &opaque_token[..opaque_token.len().min(16)]
+        );
+    }
+    if !set_auth_jwt.is_empty() {
+        debug!(
+            "set-auth-jwt header: {}...",
+            &set_auth_jwt[..set_auth_jwt.len().min(16)]
+        );
+    }
+
+    // Prefer the set-auth-jwt header (short-lived worker JWT for the WS
+    // ?token= query param). Fall back to opaque session.token, then JWT
+    // accessToken.
+    let token = if !set_auth_jwt.is_empty() {
+        set_auth_jwt
+    } else if !opaque_token.is_empty() {
+        opaque_token
+    } else {
+        access_token_jwt
+    };
 
     let url = "https://api.use.ai".parse()?;
     let cookie_header = jar
@@ -333,14 +391,90 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
         .unwrap_or_default();
 
-    info!("Account created: {} (user: {})", email, user_id.chars().take(8).collect::<String>());
+    info!(
+        "Account created: {} (user: {})",
+        email,
+        user_id.chars().take(8).collect::<String>()
+    );
     Ok(Account {
         email,
         user_id,
         cookie_header,
-        token: jwt,
+        token,
+        proxy_url: proxy_url.map(String::from),
         born: now_secs(),
     })
+}
+
+/// Refresh the session cookies and extract a fresh worker auth JWT before
+/// connecting to the agent WebSocket.
+///
+/// The __Secure-better-auth.session_data cookie has a 60-second TTL, so
+/// pooled accounts must be refreshed before each WS connection or the agent
+/// gateway rejects them with AUTH_REQUIRED (4001).
+///
+/// The get-session response includes a set-auth-jwt header containing the
+/// short-lived worker JWT. This is the same JWT the browser gets from
+/// authClient.token() and sends as ?token=<JWT> in the WS URL.
+async fn refresh_session(account: &Account, proxy_url: Option<&str>) -> Result<(String, String)> {
+    let cfg = Config::load().unwrap_or_default();
+    let auth_base = cfg.direct.auth_base;
+
+    let (client, jar) = build_client_with_jar(proxy_url)?;
+    let url = "https://api.use.ai".parse()?;
+
+    // Seed the jar with ONLY the long-lived session_token cookie. If we also
+    // seed session_data, the jar ends up with two session_data entries (old
+    // + new) and the server reads the stale one. If we seed nothing, the
+    // refreshed jar is missing session_token entirely.
+    for cookie_pair in account.cookie_header.split("; ") {
+        if cookie_pair.starts_with("__Secure-better-auth.session_token=") {
+            jar.add_cookie_str(cookie_pair, &url);
+        }
+    }
+
+    // 1. Refresh session_data cookie.
+    let resp = client
+        .get(format!("{}/get-session", auth_base))
+        .send()
+        .await
+        .map_err(|e| anyhow!("refresh get-session failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("refresh get-session failed: {} - {}", status, text);
+    }
+
+    // 2. Extract the JWT from the set-auth-jwt response header. This is the
+    // short-lived worker token for the WS ?token= query param.
+    let token = resp
+        .headers()
+        .get("set-auth-jwt")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| account.token.clone());
+
+    // Consume the body so the connection is released.
+    let _body: Value = resp.json().await?;
+
+    // The jar now has: original session_token + fresh session_data.
+    let cookie_header = jar
+        .cookies(&url)
+        .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
+        .unwrap_or_else(|| account.cookie_header.clone());
+
+    debug!(
+        "Refreshed session for user {} (token: {}...)",
+        account.user_id.chars().take(8).collect::<String>(),
+        if token.is_empty() {
+            "(none)"
+        } else {
+            &token[..token.len().min(16)]
+        }
+    );
+
+    Ok((cookie_header, token))
 }
 
 // ---------- WebSocket connection with SOCKS5 ----------
@@ -349,12 +483,37 @@ async fn connect_websocket_with_proxy(
     uri: &str,
     proxy_url: Option<&str>,
     open_timeout: Duration,
+    _bearer_token: Option<&str>,
+    cookie: Option<&str>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let mut request = uri.into_client_request()?;
     request.headers_mut().insert(
         "User-Agent",
         tungstenite::http::HeaderValue::from_static(USER_AGENT),
     );
+
+    // Origin header is required by use.ai's agent gateway — the browser always
+    // sends it and the backend may reject connections without it.
+    request.headers_mut().insert(
+        "Origin",
+        tungstenite::http::HeaderValue::from_static("https://use.ai"),
+    );
+
+    // NOTE: No Authorization header. The Python reference (verified 2026-06-26)
+    // sent only Cookie + Origin with no Bearer, and the browser does the same.
+    // Bearer has been tried (JWT accessToken, opaque session.token) and does
+    // not prevent AUTH_REQUIRED. The agent gateway authenticates via the
+    // session cookie alone.
+
+    // Send the session cookie too.
+    if let Some(cookie) = cookie.filter(|c| !c.is_empty()) {
+        request
+            .headers_mut()
+            .insert("Cookie", tungstenite::http::HeaderValue::from_str(cookie)?);
+    }
+
+    // Log the outgoing request headers for auth debugging.
+    debug!("WS upgrade to {} | headers: {:?}", uri, request.headers());
 
     if let Some(proxy) = proxy_url {
         let (host, port) = parse_socks5_proxy(proxy)?;
@@ -432,7 +591,7 @@ async fn file_part_from_data_or_url(
         .unwrap_or_else(|| guess_media_type(filename, None));
 
     let (url, media_type) = if let Some((header, base64_data)) = data_uri_parts(data_or_url) {
-        let media_type = media_type_from_data_uri_header(&header, &guessed_media_type);
+        let media_type = media_type_from_data_uri_header(header, &guessed_media_type);
         let url = upload_file_to_files(base64_data, filename, proxy_url).await?;
         (url, media_type)
     } else if data_or_url.starts_with("http://") || data_or_url.starts_with("https://") {
@@ -445,7 +604,6 @@ async fn file_part_from_data_or_url(
         let url = upload_file_to_files(data_or_url, filename, proxy_url).await?;
         (url, guessed_media_type)
     };
-
     Ok(json!({
         "type": "file",
         "mediaType": media_type,
@@ -456,21 +614,27 @@ async fn file_part_from_data_or_url(
 
 async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> Result<Vec<Value>> {
     let mut parts = Vec::new();
+    let mut recognized_content = false;
 
     match content {
         Value::String(text) => {
+            recognized_content = true;
+            let text = sanitize_inbound_text(text);
             if !text.is_empty() {
                 parts.push(json!({ "type": "text", "text": text }));
             }
         }
         Value::Object(obj) => {
             if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                recognized_content = true;
+                let text = sanitize_inbound_text(text);
                 if !text.is_empty() {
                     parts.push(json!({ "type": "text", "text": text }));
                 }
             }
 
             if let Some(image_data) = obj.get("image").and_then(|v| v.as_str()) {
+                recognized_content = true;
                 let filename = obj
                     .get("filename")
                     .and_then(|v| v.as_str())
@@ -482,6 +646,7 @@ async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> R
             }
 
             if let Some(file_url) = obj.get("file_url").and_then(|v| v.as_str()) {
+                recognized_content = true;
                 let filename = obj
                     .get("filename")
                     .and_then(|v| v.as_str())
@@ -501,13 +666,16 @@ async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> R
 
                 match obj.get("type").and_then(|v| v.as_str()) {
                     Some("text") => {
+                        recognized_content = true;
                         if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                            let text = sanitize_inbound_text(text);
                             if !text.is_empty() {
                                 parts.push(json!({ "type": "text", "text": text }));
                             }
                         }
                     }
                     Some("image_url") => {
+                        recognized_content = true;
                         if let Some(url) = obj
                             .get("image_url")
                             .and_then(|v| v.get("url"))
@@ -523,6 +691,7 @@ async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> R
                         }
                     }
                     Some("file") => {
+                        recognized_content = true;
                         if let Some(file_obj) = obj.get("file").and_then(|v| v.as_object()) {
                             let filename = file_obj
                                 .get("filename")
@@ -536,11 +705,12 @@ async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> R
 
                             if let Some(url) = file_obj.get("url").and_then(|v| v.as_str()) {
                                 parts.push(
-                                    file_part_from_data_or_url(url, filename, media_type, proxy_url)
-                                        .await?,
+                                    file_part_from_data_or_url(
+                                        url, filename, media_type, proxy_url,
+                                    )
+                                    .await?,
                                 );
-                            } else if let Some(data) =
-                                file_obj.get("data").and_then(|v| v.as_str())
+                            } else if let Some(data) = file_obj.get("data").and_then(|v| v.as_str())
                             {
                                 parts.push(
                                     file_part_from_data_or_url(
@@ -580,11 +750,40 @@ async fn build_parts_from_content(content: &Value, proxy_url: Option<&str>) -> R
         _ => warn!("Unsupported content type: {:?}", content),
     }
 
-    if parts.is_empty() {
-        parts.push(json!({ "type": "text", "text": "" }));
+    if parts.is_empty() && !recognized_content {
+        warn!(
+            "Preserving unknown content instead of dropping: {}",
+            serde_json::to_string(content).unwrap_or_default()
+        );
+
+        parts.push(json!({
+            "type": "text",
+            "text": serde_json::to_string(content).unwrap_or_default()
+        }));
     }
 
     Ok(parts)
+}
+
+fn sanitize_inbound_text(text: &str) -> String {
+    let mut cleaned = text.to_string();
+    for tag in [
+        "system-reminder",
+        "system",
+        "reminder",
+        "context",
+        "hidden",
+        "instructions",
+        "note",
+    ] {
+        let pattern = format!(r"(?is)<{tag}[^>]*>.*?</{tag}>");
+        cleaned = regex::Regex::new(&pattern)
+            .unwrap()
+            .replace_all(&cleaned, "")
+            .to_string();
+    }
+
+    cleaned.trim().to_string()
 }
 
 async fn build_frame(
@@ -597,66 +796,175 @@ async fn build_frame(
 ) -> Result<Value> {
     let model_slug = resolve_model(model);
     let selected_model = format!("{}{}", model_prefix, model_slug);
-
-    let has_structured_content = messages.iter().any(|msg| {
-        matches!(
-            msg.get("content"),
-            Some(Value::Object(_)) | Some(Value::Array(_))
-        )
-    });
+    debug!(
+        "build_frame start: chat_id={}, model={}, selected_model={}, incoming_messages={}",
+        chat_id,
+        model,
+        selected_model,
+        summarize_frame_input(messages)
+    );
 
     let mut use_messages = Vec::new();
 
-    if !has_structured_content {
-        let mut parts = Vec::new();
-        for msg in messages {
-            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                parts.push(json!({
-                    "type": "text",
-                    "text": content,
-                }));
-            }
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let is_trusted_proxy_message = msg
+            .get("metadata")
+            .and_then(|m| m.get("leech_proxy_tool_prompt"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if role == "system" {
+            debug!(
+                "Preserving system message for upstream frame. trusted={} preview={}",
+                is_trusted_proxy_message,
+                summarize_content(msg.get("content"))
+            );
         }
 
-        if parts.is_empty() {
-            parts.push(json!({
-                "type": "text",
-                "text": "Hello",
-            }));
+        let synthesized_tool_calls_text: Option<String> = if role == "assistant" {
+            msg.get("tool_calls")
+                .and_then(|v| v.as_array())
+                .filter(|calls| !calls.is_empty())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            let name = call
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())?;
+                            let raw_args = call
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            let input: Value =
+                                serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+                            Some(format!(
+                                "<tool_use>\n{}\n</tool_use>",
+                                json!({ "name": name, "input": input })
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+
+        let parts = match (&synthesized_tool_calls_text, msg.get("content")) {
+            (Some(text), _) => {
+                // opencode sends the assistant's own prior tool call back to us as
+                // {"role":"assistant","content":"","tool_calls":[...]}. If we only
+                // look at `content` here it's empty/null and the tool call info is
+                // lost entirely -- the model then has no memory of ever having
+                // called a tool on a later turn, only a "Tool result for call_X"
+                // appearing with no context. Reconstruct it in the same <tool_use>
+                // text format the model was taught, so history stays coherent.
+                vec![json!({ "type": "text", "text": text.clone() })]
+            }
+            (None, Some(content)) if is_trusted_proxy_message => {
+                // This message was constructed by leech-rs itself (the tool-call
+                // prompt + serialized tool schemas), not typed by the end user.
+                // Running it through sanitize_inbound_text() would treat our own
+                // instructions as a prompt-injection attempt and could strip out
+                // tool descriptions that happen to contain tag-like text.
+                let text = content
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| content.to_string());
+                vec![json!({ "type": "text", "text": text })]
+            }
+            (None, Some(content)) => build_parts_from_content(content, proxy_url).await?,
+            (None, None) => vec![json!({ "type": "text", "text": "" })],
+        };
+        if parts.is_empty()
+            || parts.iter().all(|part| {
+                part.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && part
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .is_empty()
+            })
+        {
+            debug!(
+                "Dropping empty message after inbound sanitization: role={} source_summary={}",
+                role,
+                summarize_frame_input(std::slice::from_ref(msg))
+            );
+            continue;
         }
 
         use_messages.push(json!({
             "id": uuid::Uuid::new_v4().simple().to_string(),
-            "role": "user",
+            "role": role,
             "parts": parts,
             "metadata": {},
         }));
-    } else {
-        for msg in messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let parts = match msg.get("content") {
-                Some(content) => build_parts_from_content(content, proxy_url).await?,
-                None => vec![json!({ "type": "text", "text": "" })],
-            };
-
-            use_messages.push(json!({
-                "id": uuid::Uuid::new_v4().simple().to_string(),
-                "role": role,
-                "parts": parts,
-                "metadata": {},
-            }));
-        }
-
-        if use_messages.is_empty() {
-            use_messages.push(json!({
-                "id": uuid::Uuid::new_v4().simple().to_string(),
-                "role": "user",
-                "parts": [{ "type": "text", "text": "" }],
-                "metadata": {},
-            }));
-        }
     }
 
+    if use_messages.is_empty() {
+        use_messages.push(json!({
+            "id": uuid::Uuid::new_v4().simple().to_string(),
+            "role": "user",
+            "parts": [{ "type": "text", "text": "" }],
+            "metadata": {},
+        }));
+    }
+
+    // NOTE: this intentionally skips our own `leech_proxy_tool_prompt` message.
+    // That message always contains "<tool_use>" / "Available tools:" (it's the
+    // text we inject to *simulate* tool calling), so without this exclusion every
+    // tool-enabled request flips agenticMode on and gets routed to use.ai's real
+    // Agent product (source=agent_page), which has its own real system context
+    // about its own real capabilities. That context contradicts our pretend-tools
+    // instructions and is why the model says "I don't have access to your files"
+    // instead of emitting a fake tool call. Only let *real* conversation content
+    // (actual prior tool results, etc.) trigger agentic mode.
+    debug!(
+        "build_frame assembled messages: {}",
+        summarize_frame_messages(&json!({ "messages": use_messages.clone() }))
+    );
+    let has_proxy_tool_prompt_context = messages.iter().any(|msg| {
+        msg.get("metadata")
+            .and_then(|m| m.get("leech_proxy_tool_prompt"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    });
+
+    let agentic_mode = if has_proxy_tool_prompt_context {
+        false
+    } else {
+        messages.iter().any(|msg| {
+            let content = msg.get("content");
+            match content {
+                Some(Value::String(text)) => {
+                    text.contains("<tool_use>")
+                        || text.contains("tool_choice")
+                        || text.contains("Available tools:")
+                        || text.contains("function_call_output")
+                        || text.contains("Tool result for ")
+                }
+                Some(Value::Array(items)) => {
+                    items.iter().any(|item| item.to_string().contains("tool"))
+                }
+                Some(Value::Object(obj)) => serde_json::Value::Object(obj.clone())
+                    .to_string()
+                    .contains("tool"),
+                _ => false,
+            }
+        })
+    };
+
+    debug!(
+        "build_frame final flags: proxy_tool_prompt_context={}, agentic_mode={}, outgoing_count={}",
+        has_proxy_tool_prompt_context,
+        agentic_mode,
+        use_messages.len()
+    );
     Ok(json!({
         "chatId": chat_id,
         "userId": account.user_id,
@@ -674,7 +982,7 @@ async fn build_frame(
         "isWebSearchMode": false,
         "isDeepResearchMode": false,
         "isImageGenerationMode": false,
-        "agenticMode": false,
+        "agenticMode": agentic_mode,
         "isStandaloneImageMode": false,
         "needsBlurPreview": false,
         "deepResearchProcessor": "pro-fast",
@@ -684,8 +992,60 @@ async fn build_frame(
         "userCountry": "Croatia (HR)",
         "messages": use_messages,
         "trigger": "submit-message",
-        "source": "chat_page",
+        "source": if agentic_mode { "agent_page" } else { "chat_page" },
     }))
+}
+
+fn summarize_frame_input(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+            let trusted = msg
+                .get("metadata")
+                .and_then(|m| m.get("leech_proxy_tool_prompt"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_tool_calls = msg
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false);
+            let preview = msg
+                .get("content")
+                .map(|v| v.to_string().chars().take(80).collect::<String>())
+                .unwrap_or_default();
+            format!(
+                "{}:{}:trusted={}:tool_calls={}:{}",
+                idx, role, trusted, has_tool_calls, preview
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+fn summarize_content(content: Option<&Value>) -> String {
+    let text = match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::Object(obj)) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| content.unwrap().to_string()),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+
+    let mut preview = text.chars().take(160).collect::<String>();
+    if text.chars().count() > 160 {
+        preview.push_str("...");
+    }
+    preview.replace('\n', "\\n")
 }
 
 // ---------- Streaming completion ----------
@@ -695,17 +1055,18 @@ pub async fn stream_completion(
     messages: &[Value],
     proxy_url: Option<&str>,
     account: Account,
-) -> impl futures::Stream<Item = Result<String>> {
+) -> BoxStream<'static, Result<String>> {
     use futures::stream::{self, BoxStream};
 
     let cfg = Config::load().unwrap_or_default();
     let chat_id = uuid::Uuid::new_v4().to_string();
-    let uri = format!(
-        "{}/{chat_id}?userId={}&userType=regular&userEmail={}&planType=free&isTestUser=false&token={}",
-        cfg.direct.ws_agent_base,
-        account.user_id,
-        account.email,
-        account.token,
+    // Base URI without token — the token is added in attempt() after
+    // refresh_session, because use.ai's agent gateway authenticates via
+    // a ?token=<JWT> query parameter (from POST /api/auth/token), NOT via
+    // Authorization header or cookie alone.
+    let uri_base = format!(
+        "{}/{chat_id}?userId={}&userType=regular&userEmail={}&planType=free&isTestUser=false",
+        cfg.direct.ws_agent_base, account.user_id, account.email,
     );
 
     let open_timeout = Duration::from_secs(cfg.direct.ws_open_timeout_sec);
@@ -713,8 +1074,9 @@ pub async fn stream_completion(
     let retries = cfg.direct.direct_ws_retries.max(1);
     let model_prefix = cfg.direct.model_prefix.clone();
 
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
-        uri: String,
+        uri_base: String,
         chat_id: String,
         account: Account,
         model: String,
@@ -724,8 +1086,41 @@ pub async fn stream_completion(
         open_timeout: Duration,
         idle_timeout: Duration,
     ) -> Result<BoxStream<'static, Result<String>>> {
-        let mut ws_stream =
-            connect_websocket_with_proxy(&uri, proxy_url.as_deref(), open_timeout).await?;
+        // Use the account's original signup proxy for refresh and WS — use.ai
+        // binds the session to the signup IP. Connecting from a different Tor
+        // exit causes AUTH_REQUIRED (4001) on the agent WebSocket.
+        let account_proxy = account.proxy_url.as_deref().or(proxy_url.as_deref());
+
+        // Refresh the session cookies before connecting. The
+        // __Secure-better-auth.session_data JWT has a 60-second TTL, so
+        // pooled accounts must be refreshed or the agent gateway rejects
+        // with AUTH_REQUIRED (4001).
+        let (cookie_header, token) = match refresh_session(&account, account_proxy).await {
+            Ok((c, t)) => (c, t),
+            Err(e) => {
+                debug!("Session refresh failed ({}), using original cookies", e);
+                (account.cookie_header.clone(), account.token.clone())
+            }
+        };
+
+        // Build the full WS URI with the JWT token as a query parameter.
+        // use.ai's agent gateway authenticates via ?token=<JWT> (from the
+        // /api/auth/token endpoint), NOT via Authorization header. The
+        // browser does: new WebSocket(baseUrl + "/" + chatId + "?token=...")
+        let uri = if token.is_empty() {
+            uri_base.clone()
+        } else {
+            format!("{}&token={}", uri_base, token)
+        };
+
+        let mut ws_stream = connect_websocket_with_proxy(
+            &uri,
+            account_proxy,
+            open_timeout,
+            None,
+            Some(&cookie_header),
+        )
+        .await?;
 
         let frame = build_frame(
             &chat_id,
@@ -733,9 +1128,13 @@ pub async fn stream_completion(
             &model,
             &messages,
             &model_prefix,
-            proxy_url.as_deref(),
+            account_proxy,
         )
         .await?;
+        debug!(
+            "Upstream frame messages: {}",
+            summarize_frame_messages(&frame)
+        );
         ws_stream.send(Message::Text(frame.to_string())).await?;
 
         let mut filter = InjectionFilter::new();
@@ -755,6 +1154,8 @@ pub async fn stream_completion(
                 };
 
                 if let Message::Text(text) = msg {
+                    // Log every raw text frame for protocol debugging.
+                    debug!("WS recv text ({} bytes): {}", text.len(), &text[..text.len().min(300)]);
                     if let Ok(val) = serde_json::from_str::<Value>(&text) {
                         if let Some(chunk) = val.get("chunk") {
                             if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
@@ -775,7 +1176,8 @@ pub async fn stream_completion(
                             }
                         }
                     }
-                } else if let Message::Close(_) = msg {
+                } else if let Message::Close(frame) = msg {
+                    debug!("WS close frame received: {:?}", frame);
                     break;
                 }
             }
@@ -800,7 +1202,7 @@ pub async fn stream_completion(
 
     for attempt_proxy in attempts {
         match attempt(
-            uri.clone(),
+            uri_base.clone(),
             chat_id.clone(),
             account.clone(),
             model.to_string(),
@@ -824,23 +1226,184 @@ pub async fn stream_completion(
     Box::pin(stream::once(async move { Err(err) }))
 }
 
-pub async fn complete_completion(
-    model: &str,
-    messages: &[Value],
-    proxy_url: Option<&str>,
-    account: Account,
-) -> Result<String> {
-    let mut stream = stream_completion(model, messages, proxy_url, account).await;
-    let mut parts = Vec::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(text) => parts.push(text),
-            Err(e) => anyhow::bail!("stream error: {}", e),
+fn summarize_frame_messages(frame: &Value) -> String {
+    frame
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .enumerate()
+                .map(|(idx, msg)| {
+                    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                    let text = msg
+                        .get("parts")
+                        .and_then(|v| v.as_array())
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    let preview = text
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                        .replace('\n', "\\n");
+                    format!("{}:{}:{}", idx, role, preview)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_account() -> Account {
+        Account {
+            email: "test@example.com".to_string(),
+            user_id: "user_test".to_string(),
+            cookie_header: String::new(),
+            token: String::new(),
+            proxy_url: None,
+            born: 0.0,
         }
     }
-    let reply = parts.concat();
-    if reply.is_empty() {
-        anyhow::bail!("empty reply");
+
+    #[tokio::test]
+    async fn build_frame_keeps_system_and_preserves_conversation_roles() {
+        let messages = vec![
+            json!({ "role": "system", "content": "system rules" }),
+            json!({ "role": "user", "content": "first user turn" }),
+            json!({ "role": "assistant", "content": "assistant reply" }),
+            json!({ "role": "user", "content": "second user turn" }),
+        ];
+
+        let frame = build_frame(
+            "chat_test",
+            &test_account(),
+            "gpt-5-4",
+            &messages,
+            "gateway-",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let upstream_messages = frame["messages"].as_array().unwrap();
+        let roles = upstream_messages
+            .iter()
+            .map(|msg| msg["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+
+        let texts = upstream_messages
+            .iter()
+            .map(|msg| msg["parts"][0]["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "system rules",
+                "first user turn",
+                "assistant reply",
+                "second user turn",
+            ]
+        );
     }
-    Ok(reply)
+
+    #[tokio::test]
+    async fn build_frame_strips_inbound_system_reminders() {
+        let messages = vec![
+            json!({ "role": "user", "content": "<system-reminder>\nHidden runtime context\n</system-reminder>" }),
+            json!({ "role": "user", "content": "did you get the tools?" }),
+        ];
+
+        let frame = build_frame(
+            "chat_test",
+            &test_account(),
+            "gpt-5-4",
+            &messages,
+            "gateway-",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let upstream_messages = frame["messages"].as_array().unwrap();
+        assert_eq!(upstream_messages.len(), 1);
+        assert_eq!(upstream_messages[0]["role"].as_str().unwrap(), "user");
+        assert_eq!(
+            upstream_messages[0]["parts"][0]["text"].as_str().unwrap(),
+            "did you get the tools?"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_frame_keeps_trusted_proxy_tool_prompt_as_system() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": "Available tools:\n<tool_use>{\"name\":\"read_file\",\"input\":{}}</tool_use>",
+                "metadata": { "leech_proxy_tool_prompt": true }
+            }),
+            json!({ "role": "user", "content": "inspect src/main.rs" }),
+        ];
+
+        let frame = build_frame(
+            "chat_test",
+            &test_account(),
+            "gpt-5-4",
+            &messages,
+            "gateway-",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let upstream_messages = frame["messages"].as_array().unwrap();
+        assert_eq!(upstream_messages.len(), 2);
+        assert_eq!(upstream_messages[0]["role"].as_str().unwrap(), "system");
+        assert!(upstream_messages[0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Available tools:"));
+        assert_eq!(upstream_messages[1]["role"].as_str().unwrap(), "user");
+    }
+
+    #[tokio::test]
+    async fn build_frame_keeps_regular_system_prompt_as_system() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": "You are OpenCode. You and the user share the same workspace."
+            }),
+            json!({ "role": "user", "content": "inspect src/main.rs" }),
+        ];
+
+        let frame = build_frame(
+            "chat_test",
+            &test_account(),
+            "gpt-5-4",
+            &messages,
+            "gateway-",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let upstream_messages = frame["messages"].as_array().unwrap();
+        assert_eq!(upstream_messages.len(), 2);
+        assert_eq!(upstream_messages[0]["role"].as_str().unwrap(), "system");
+        assert!(upstream_messages[0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("You are OpenCode"));
+        assert_eq!(upstream_messages[1]["role"].as_str().unwrap(), "user");
+    }
 }

@@ -11,6 +11,16 @@ ws_idle_timeout_sec = 90
 direct_ws_retries = 2
 direct_max_concurrency = 24
 
+[zenmux]
+auth_base = "https://api.zenmux.ai/v1/auth"
+ws_agent_base = "wss://agents.zenmux.ai/agents/budget-agent"
+model_prefix = "zenmux-"
+
+[sakana]
+auth_base = "https://api.sakana.ai/v1/auth"
+ws_agent_base = "wss://agents.sakana.ai/agents/budget-agent"
+model_prefix = "sakana-"
+
 [account_pool]
 size = 100
 ttl_sec = 1800
@@ -23,8 +33,18 @@ signup_delay_ms = 1000
 tor_ports = [9050, 9051, 9052]
 tor_instances = 3
 
+[provider_proxies]
+use_ai_ports = [9050, 9051, 9052, 9053, 9054, 9055, 9056, 9057, 9058, 9059, 9060]
+sakana_ports = []
+faceb_ports = [9071, 9072, 9073, 9074, 9075, 9076, 9077, 9078, 9079, 9080]
+
 [models]
 default = "gpt-5-4"
 
 [thinking]
+expose_tool_thinking = false
 levels = { low = 1024, medium = 5000, high = 16000, max = 32000 }
+
+[logging]
+level = "info"
+debug_protocol = false
