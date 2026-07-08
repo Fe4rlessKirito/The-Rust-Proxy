@@ -19,3 +19,21 @@ Auto‑launches Tor –  The proxy starts it, handles the SOCKS port, and even k
 Load monitoring – new /proxies endpoint shows active proxies, request rate, and windowed request count. Great for observability.
 
 Better error handling – automatic retries on 429 (rate limit) with exponential backoff, plus fallback to direct mode if all proxies fail.
+
+🧩 Provider Status
+Working:
+- use.ai – primary provider, default catalog models.
+- Sakana – `sakana-*` models (Namazu via chat-site flow; Fugu via official API when `SAKANA_API_KEY` is set, otherwise chat-site fallback).
+
+Not working / not implemented yet:
+- Faceb – `faceb-*` models. Adapter and key pool exist but credits run out; needs testing when credits are available.
+- Groq – `gro-*` models. Adapter present but not wired into the live routing surface.
+- Freemodel – only feasible if free Chinese phone numbers are obtainable somewhere for signup.
+
+💾 Memory Footprint
+The proxy server itself is tiny:
+- Server / proxy process: ~3–5 MB RAM (around 2 MB at startup; grows with pool size).
+- Each `tor.exe` instance: ~70–90 MB RAM.
+
+So total memory scales with how many Tor instances are running. Startup warms a minimal set (use.ai first 2 ports, Faceb first 1 port) and the scale controller adds/removes use.ai Tor instances within the configured range based on load — keep the Tor count in mind when sizing the host.
+
