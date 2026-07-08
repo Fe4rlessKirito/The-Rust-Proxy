@@ -76,6 +76,12 @@ impl ScaleController {
                 load, current_proxies, pool_ratio
             );
 
+            // Evict any registered proxy whose tor process has died. Without
+            // this, dead ports stay in rotation forever (registration only
+            // checked reachability once, at spawn time) and requests
+            // round-robin onto them, failing with "Proxy server unreachable".
+            self.sweep_dead_proxies().await;
+
             let mut last_scale = self.last_scale.lock().await;
             if !last_scale.is_none_or(|t| t.elapsed() >= self.cooldown) {
                 continue;
@@ -156,5 +162,35 @@ impl ScaleController {
                 .provider_proxies,
         )
         .await;
+    }
+
+    /// Probe every active use.ai-scale proxy and evict any whose Tor SOCKS
+    /// listener is no longer reachable. A tor process's SOCKS listener stays up
+    /// across circuit rebuilds, so a failed probe means the process is gone and
+    /// the port must leave rotation or requests will keep failing with
+    /// "Proxy server unreachable".
+    async fn sweep_dead_proxies(&self) {
+        let active = self.active_provider_proxies().await;
+        let mut dead: Vec<u16> = Vec::new();
+        for url in &active {
+            let Some(port) = url.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+                continue;
+            };
+            if !self.tor_manager.is_socks_reachable(port).await {
+                dead.push(port);
+            }
+        }
+
+        if dead.is_empty() {
+            return;
+        }
+
+        for port in dead {
+            match self.tor_manager.remove_proxy(port).await {
+                Ok(()) => info!("Evicted dead Tor proxy on port {}", port),
+                Err(e) => warn!("Failed to evict dead Tor proxy on port {}: {}", port, e),
+            }
+        }
+        self.sync_provider_assignments().await;
     }
 }

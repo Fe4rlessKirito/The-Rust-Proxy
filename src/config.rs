@@ -30,6 +30,14 @@ pub struct DirectConfig {
     pub ws_idle_timeout_sec: u64,
     pub direct_ws_retries: u32,
     pub direct_max_concurrency: usize,
+    /// When true, the proxy auto-sends a "Continue." follow-up turn on the
+    /// same WebSocket if the assistant's turn looks like a premature intent
+    /// announcement (e.g. "I'll fix the UI, then build a patch.") with no
+    /// actual work artifact. See `looks_like_premature_intent` in direct.rs.
+    pub auto_continue: bool,
+    /// Maximum number of auto-continue follow-ups per request. Caps runaway
+    /// loops once the heuristic stops matching.
+    pub auto_continue_max: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -86,6 +94,8 @@ impl Default for Config {
                 ws_idle_timeout_sec: 90,
                 direct_ws_retries: 2,
                 direct_max_concurrency: 24,
+                auto_continue: true,
+                auto_continue_max: 3,
             },
             account_pool: AccountPoolConfig {
                 size: 100,

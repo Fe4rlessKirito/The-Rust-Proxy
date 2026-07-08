@@ -10,6 +10,10 @@ ws_open_timeout_sec = 30
 ws_idle_timeout_sec = 90
 direct_ws_retries = 2
 direct_max_concurrency = 24
+# Auto-send a "Continue." follow-up turn when the model announces work without
+# doing it (e.g. "I'll fix the UI, then build a patch." then stops).
+auto_continue = true
+auto_continue_max = 3
 
 [zenmux]
 auth_base = "https://api.zenmux.ai/v1/auth"

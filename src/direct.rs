@@ -1182,6 +1182,30 @@ fn summarize_content(content: Option<&Value>) -> String {
     preview.replace('\n', "\\n")
 }
 
+/// Detect a "premature intent" turn: the assistant announced work it will do
+/// ("I'll fix…", "let me…", "I'm going to…") without producing any actual work
+/// artifact (no fenced code block, no `<tool_use>`). These are the turns that
+/// end early and force the user to type "continue". Requiring an intent lead-in
+/// *and* the absence of work artifacts keeps false positives very low: genuine
+/// completions and real tool calls never match.
+fn looks_like_premature_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("```") || lower.contains("<tool_use>") {
+        return false;
+    }
+    let intent = [
+        "i'll",
+        "i will",
+        "let me",
+        "i'm going to",
+        "i am going to",
+        "i plan to",
+        "i'm gonna",
+        "i am gonna",
+    ];
+    intent.iter().any(|p| lower.contains(p))
+}
+
 // ---------- Streaming completion ----------
 
 pub async fn stream_completion(
@@ -1219,6 +1243,8 @@ pub async fn stream_completion(
         model_prefix: String,
         open_timeout: Duration,
         idle_timeout: Duration,
+        auto_continue: bool,
+        auto_continue_max: u32,
     ) -> Result<BoxStream<'static, Result<String>>> {
         // Use the account's original signup proxy for refresh and WS — use.ai
         // binds the session to the signup IP. Connecting from a different Tor
@@ -1284,6 +1310,16 @@ pub async fn stream_completion(
 
         let mut filter = InjectionFilter::new();
         let stream = async_stream::stream! {
+            // Running conversation history. The initial frame was already sent
+            // from `messages`; on an auto-continue we append the just-finished
+            // assistant segment + a "Continue." user turn and resend the full
+            // history as a new submit-message frame on this same WebSocket.
+            let mut conversation = messages.clone();
+            // Accumulates the visible text of the current segment so the
+            // premature-intent heuristic can inspect it on `finish`.
+            let mut assistant_text = String::new();
+            let mut continuations = 0u32;
+
             loop {
                 let msg = match tokio::time::timeout(idle_timeout, ws_stream.next()).await {
                     Ok(Some(Ok(msg))) => msg,
@@ -1305,6 +1341,7 @@ pub async fn stream_completion(
                         if let Some(chunk) = val.get("chunk") {
                             if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
                                 let safe = filter.feed(delta);
+                                assistant_text.push_str(&safe);
                                 if !safe.is_empty() {
                                     yield Ok(safe);
                                 }
@@ -1313,6 +1350,69 @@ pub async fn stream_completion(
 
                         if let Some(typ) = val.get("type").and_then(|t| t.as_str()) {
                             if typ == "finish" || typ == "stream-complete" {
+                                // If the turn looks like a premature intent
+                                // announcement (no work artifact + future-tense
+                                // lead-in), send a "Continue." follow-up on the
+                                // same WS and keep streaming, up to the cap.
+                                if auto_continue
+                                    && continuations < auto_continue_max
+                                    && !assistant_text.is_empty()
+                                    && looks_like_premature_intent(&assistant_text)
+                                {
+                                    continuations += 1;
+                                    // Drain filter state so it doesn't carry
+                                    // into the next segment. flush() is
+                                    // idempotent, so the end-of-block flush
+                                    // below stays a no-op on the break paths.
+                                    let tail = filter.flush();
+                                    if !tail.is_empty() {
+                                        yield Ok(tail);
+                                    }
+                                    debug!(
+                                        "Auto-continue {}/{}: premature intent detected, sending \"Continue.\"",
+                                        continuations, auto_continue_max
+                                    );
+                                    conversation.push(json!({
+                                        "role": "assistant",
+                                        "content": assistant_text.clone(),
+                                    }));
+                                    conversation.push(json!({
+                                        "role": "user",
+                                        "content": "Continue.",
+                                    }));
+                                    assistant_text.clear();
+
+                                    let cont_frame = match build_frame(
+                                        &chat_id,
+                                        &account,
+                                        &model,
+                                        &conversation,
+                                        &model_prefix,
+                                        account.proxy_url.as_deref().or(proxy_url.as_deref()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            yield Err(anyhow!(
+                                                "auto-continue build_frame failed: {}",
+                                                e
+                                            ));
+                                            break;
+                                        }
+                                    };
+                                    if let Err(e) = ws_stream
+                                        .send(Message::Text(cont_frame.to_string()))
+                                        .await
+                                    {
+                                        yield Err(anyhow!(
+                                            "auto-continue send failed: {}",
+                                            e
+                                        ));
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 break;
                             }
                             if typ == "rate-limit-error" {
@@ -1356,6 +1456,8 @@ pub async fn stream_completion(
             model_prefix.clone(),
             open_timeout,
             idle_timeout,
+            cfg.direct.auto_continue,
+            cfg.direct.auto_continue_max,
         )
         .await
         {
@@ -1551,5 +1653,47 @@ mod tests {
             .unwrap()
             .contains("You are OpenCode"));
         assert_eq!(upstream_messages[1]["role"].as_str().unwrap(), "user");
+    }
+
+    #[test]
+    fn premature_intent_matches_reported_announcement() {
+        // The exact case from the bug report: model says what it will do, then
+        // stops the turn instead of doing the work.
+        let text = "You're right - that view is basically unstyled raw HTML. \
+                    I'll fix the UI styling and spacing, then build and release a patch.";
+        assert!(looks_like_premature_intent(text));
+    }
+
+    #[test]
+    fn premature_intent_matches_other_lead_ins() {
+        assert!(looks_like_premature_intent(
+            "I'm going to refactor src/main.rs next."
+        ));
+        assert!(looks_like_premature_intent(
+            "Let me update the config and redeploy."
+        ));
+        assert!(looks_like_premature_intent("I will add tests for this."));
+    }
+
+    #[test]
+    fn premature_intent_rejects_code_block() {
+        // A turn that already produced a code block is real work, not a preamble.
+        let text = "Here is the fix:\n```rust\nfn main() {}\n```";
+        assert!(!looks_like_premature_intent(text));
+    }
+
+    #[test]
+    fn premature_intent_rejects_tool_use() {
+        // Real agentic tool calls must never be auto-continued; the client
+        // handles them.
+        let text = "<tool_use>\n{\"name\":\"edit\",\"input\":{\"path\":\"a.rs\"}}\n</tool_use>";
+        assert!(!looks_like_premature_intent(text));
+    }
+
+    #[test]
+    fn premature_intent_rejects_genuine_completion() {
+        // No intent lead-in -> the model actually finished.
+        assert!(!looks_like_premature_intent("Done. The build passed."));
+        assert!(!looks_like_premature_intent(""));
     }
 }

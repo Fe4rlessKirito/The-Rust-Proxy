@@ -125,6 +125,15 @@ impl TorManager {
         self.proxy_list.lock().await.clone()
     }
 
+    /// Liveness probe for a registered Tor SOCKS port. The scale controller
+    /// uses this to evict proxies whose tor process has died after registration
+    /// (registration only confirms reachability once, at spawn time). A tor
+    /// process's SOCKS listener stays up across circuit rebuilds, so a failure
+    /// here means the process is genuinely gone.
+    pub async fn is_socks_reachable(&self, port: u16) -> bool {
+        tor_socks_reachable("127.0.0.1", port).await
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<Vec<String>> {
         self.proxy_receiver.clone()
     }
