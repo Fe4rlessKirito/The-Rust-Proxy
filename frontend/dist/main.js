@@ -198,20 +198,27 @@ function providerSummary(pools) {
         .join("  ");
 }
 function renderModelOptions(models) {
-    const select = document.querySelector("#model-select");
-    if (!select)
+    const label = document.querySelector("#model-picker-label");
+    const menu = document.querySelector("#model-menu");
+    if (!label || !menu)
         return;
     const modelList = models.length ? models : [{ id: state.model, label: state.model }];
-    select.innerHTML = modelList
-        .map((model) => {
-        const selected = model.id === state.model ? "selected" : "";
-        return `<option value="${escapeHtml(model.id)}" ${selected}>${escapeHtml(model.label ?? model.id)}</option>`;
-    })
-        .join("");
     if (!modelList.some((model) => model.id === state.model)) {
         state.model = modelList[0]?.id ?? "gpt-5-4";
         localStorage.setItem("leech-model", state.model);
     }
+    const selectedModel = modelList.find((model) => model.id === state.model);
+    label.textContent = selectedModel?.label ?? state.model;
+    menu.innerHTML = modelList
+        .map((model) => {
+        const selected = model.id === state.model ? " active" : "";
+        return `
+        <button class="model-option${selected}" type="button" data-model-id="${escapeHtml(model.id)}">
+          ${escapeHtml(model.label ?? model.id)}
+        </button>
+      `;
+    })
+        .join("");
 }
 function renderMessages() {
     const conversation = document.querySelector("#chat-view");
@@ -650,7 +657,8 @@ function newChat() {
 function attachEvents() {
     const form = document.querySelector("#chat-form");
     const prompt = document.querySelector("#prompt");
-    const select = document.querySelector("#model-select");
+    const modelPicker = document.querySelector("#model-picker");
+    const modelMenu = document.querySelector("#model-menu");
     const newChatButton = document.querySelector("#new-chat");
     const refreshButton = document.querySelector("#refresh-status");
     const viewToggle = document.querySelector("#view-toggle");
@@ -675,9 +683,13 @@ function attachEvents() {
             form?.requestSubmit();
         }
     });
-    select?.addEventListener("change", () => {
-        state.model = select.value;
-        localStorage.setItem("leech-model", state.model);
+    modelPicker?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (!modelMenu)
+            return;
+        const isOpen = modelMenu.hidden;
+        modelMenu.hidden = !isOpen;
+        modelPicker.setAttribute("aria-expanded", String(isOpen));
     });
     newChatButton?.addEventListener("click", newChat);
     refreshButton?.addEventListener("click", () => { void refreshStatus(); });
@@ -695,6 +707,21 @@ function attachEvents() {
     deleteFileButton?.addEventListener("click", () => { void deleteSelectedFileFromWorkspace(); });
     applyReplyButton?.addEventListener("click", () => { void applyLatestReplyToSelectedFile(); });
     document.body.addEventListener("click", (event) => {
+        const modelButton = event.target.closest("[data-model-id]");
+        if (modelButton) {
+            state.model = modelButton.dataset.modelId ?? state.model;
+            localStorage.setItem("leech-model", state.model);
+            renderModelOptions(state.models);
+            if (modelMenu && modelPicker) {
+                modelMenu.hidden = true;
+                modelPicker.setAttribute("aria-expanded", "false");
+            }
+            return;
+        }
+        if (!event.target.closest(".model-picker-wrap") && modelMenu && modelPicker) {
+            modelMenu.hidden = true;
+            modelPicker.setAttribute("aria-expanded", "false");
+        }
         const fileButton = event.target.closest("[data-file-id]");
         if (fileButton) {
             state.selectedFileId = fileButton.dataset.fileId ?? null;
@@ -707,6 +734,12 @@ function attachEvents() {
         prompt.value = button.dataset.prompt ?? "";
         resizeComposer();
         prompt.focus();
+    });
+    document.body.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && modelMenu && modelPicker) {
+            modelMenu.hidden = true;
+            modelPicker.setAttribute("aria-expanded", "false");
+        }
     });
 }
 function renderShell() {
@@ -863,9 +896,13 @@ function renderShell() {
           <div class="composer-actions">
             <div class="composer-left">
               <button id="attach-file" class="icon-button" type="button" title="Attach files">+</button>
-              <select id="model-select" class="composer-model">
-                <option value="${escapeHtml(state.model)}">${escapeHtml(state.model)}</option>
-              </select>
+              <div class="model-picker-wrap">
+                <button id="model-picker" class="model-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="model-picker-label">${escapeHtml(state.model)}</span>
+                  <span class="model-caret">v</span>
+                </button>
+                <div id="model-menu" class="model-menu" role="listbox" hidden></div>
+              </div>
             </div>
             <button id="send-button" class="send-icon" type="submit" title="Send">↑</button>
           </div>
@@ -1470,15 +1507,86 @@ function injectStyles() {
       background: #fffaf2;
     }
 
-    .composer-model {
+    .model-picker-wrap {
+      position: relative;
+      min-width: 0;
+    }
+
+    .model-picker-button {
+      align-items: center;
+      background: transparent;
       border: 0;
       border-radius: 999px;
-      background: transparent;
       color: var(--ink);
-      min-width: 92px;
-      max-width: 260px;
+      display: inline-flex;
+      gap: 8px;
       min-height: 30px;
-      padding: 0 24px 0 8px;
+      max-width: min(260px, calc(100vw - 120px));
+      padding: 0 10px;
+    }
+
+    .model-picker-button:hover,
+    .model-picker-button[aria-expanded="true"] {
+      background: rgba(243, 238, 230, 0.08);
+    }
+
+    #model-picker-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-caret {
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1;
+    }
+
+    .model-menu {
+      background: #1d1b18;
+      border: 1px solid rgba(243, 238, 230, 0.14);
+      border-radius: 10px;
+      bottom: 38px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+      display: grid;
+      gap: 2px;
+      left: 0;
+      max-height: 330px;
+      overflow-y: auto;
+      padding: 6px;
+      position: absolute;
+      width: min(320px, calc(100vw - 80px));
+      z-index: 30;
+    }
+
+    .model-menu[hidden] {
+      display: none;
+    }
+
+    .model-option {
+      background: transparent;
+      border: 0;
+      border-radius: 7px;
+      color: #f3eee6;
+      min-height: 34px;
+      overflow: hidden;
+      padding: 7px 10px;
+      text-align: left;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      width: 100%;
+    }
+
+    .model-option:hover,
+    .model-option:focus {
+      background: rgba(243, 238, 230, 0.1);
+      outline: none;
+    }
+
+    .model-option.active {
+      background: #f4f0e9;
+      color: #15130f;
+      font-weight: 700;
     }
 
     @media (max-width: 920px) {
