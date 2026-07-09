@@ -437,6 +437,7 @@ async fn refresh_session(
 ) -> Result<(String, String, Option<String>)> {
     let cfg = Config::load().unwrap_or_default();
     let auth_base = cfg.direct.auth_base;
+    let debug_protocol = cfg.logging.debug_protocol;
 
     let (client, jar) = build_client_with_jar(proxy_url)?;
     let url = "https://api.use.ai".parse()?;
@@ -494,19 +495,21 @@ async fn refresh_session(
         .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
         .unwrap_or_else(|| account.cookie_header.clone());
 
-    debug!(
-        "Refreshed session for user {} (token: {}..., app_token: {})",
-        account.user_id.chars().take(8).collect::<String>(),
-        if token.is_empty() {
-            "(none)"
-        } else {
-            &token[..token.len().min(16)]
-        },
-        app_token
-            .as_deref()
-            .map(|s| &s[..s.len().min(16)])
-            .unwrap_or("(none)")
-    );
+    if debug_protocol {
+        debug!(
+            "Refreshed session for user {} (token: {}..., app_token: {})",
+            account.user_id.chars().take(8).collect::<String>(),
+            if token.is_empty() {
+                "(none)"
+            } else {
+                &token[..token.len().min(16)]
+            },
+            app_token
+                .as_deref()
+                .map(|s| &s[..s.len().min(16)])
+                .unwrap_or("(none)")
+        );
+    }
 
     Ok((cookie_header, token, app_token))
 }
@@ -545,6 +548,7 @@ async fn connect_websocket_with_proxy(
     open_timeout: Duration,
     _bearer_token: Option<&str>,
     cookie: Option<&str>,
+    debug_protocol: bool,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let mut request = uri.into_client_request()?;
     request.headers_mut().insert(
@@ -573,7 +577,9 @@ async fn connect_websocket_with_proxy(
     }
 
     // Log the outgoing request headers for auth debugging.
-    debug!("WS upgrade to {} | headers: {:?}", uri, request.headers());
+    if debug_protocol {
+        debug!("WS upgrade to {} | headers: {:?}", uri, request.headers());
+    }
 
     if let Some(proxy) = proxy_url {
         let (host, port) = parse_socks5_proxy(proxy)?;
@@ -595,12 +601,14 @@ async fn connect_websocket_with_proxy(
             .await
         {
             Ok((ws, response)) => {
-                debug!(
-                    "WS upgrade response via {}: {} (host: {})",
-                    proxy_endpoint,
-                    response.status(),
-                    proxy_url.unwrap_or("?")
-                );
+                if debug_protocol {
+                    debug!(
+                        "WS upgrade response via {}: {} (host: {})",
+                        proxy_endpoint,
+                        response.status(),
+                        proxy_url.unwrap_or("?")
+                    );
+                }
                 Ok(ws)
             }
             Err(e) => {
@@ -636,7 +644,9 @@ async fn connect_websocket_with_proxy(
         .await
         {
             Ok(Ok((ws, response))) => {
-                debug!("WS upgrade response (direct): {}", response.status());
+                if debug_protocol {
+                    debug!("WS upgrade response (direct): {}", response.status());
+                }
                 Ok(ws)
             }
             Ok(Err(e)) => {
@@ -1250,6 +1260,7 @@ pub async fn stream_completion(
     let model_prefix = cfg.direct.model_prefix.clone();
     let auto_continue = cfg.direct.auto_continue;
     let auto_continue_max = cfg.direct.auto_continue_max;
+    let debug_protocol = cfg.logging.debug_protocol;
     let backoff_base = Duration::from_millis(cfg.direct.direct_ws_backoff_base_ms);
     let backoff_max = Duration::from_millis(cfg.direct.direct_ws_backoff_max_ms);
     let backoff_factor = cfg.direct.direct_ws_backoff_factor;
@@ -1315,6 +1326,7 @@ pub async fn stream_completion(
                     idle_timeout,
                     auto_continue,
                     auto_continue_max,
+                    debug_protocol,
                 )
                 .await
                 {
@@ -1363,6 +1375,7 @@ pub async fn stream_completion(
         idle_timeout: Duration,
         auto_continue: bool,
         auto_continue_max: u32,
+        debug_protocol: bool,
     ) -> Result<BoxStream<'static, Result<String>>> {
         // Use the account's original signup proxy for refresh and WS — use.ai
         // binds the session to the signup IP. Connecting from a different Tor
@@ -1408,6 +1421,7 @@ pub async fn stream_completion(
             open_timeout,
             None,
             Some(&cookie_header),
+            debug_protocol,
         )
         .await?;
 
@@ -1420,10 +1434,12 @@ pub async fn stream_completion(
             account_proxy,
         )
         .await?;
-        debug!(
-            "Upstream frame messages: {}",
-            summarize_frame_messages(&frame)
-        );
+        if debug_protocol {
+            debug!(
+                "Upstream frame messages: {}",
+                summarize_frame_messages(&frame)
+            );
+        }
         ws_stream.send(Message::Text(frame.to_string())).await?;
 
         let mut filter = InjectionFilter::new();
@@ -1453,8 +1469,17 @@ pub async fn stream_completion(
                 };
 
                 if let Message::Text(text) = msg {
-                    // Log every raw text frame for protocol debugging.
-                    debug!("WS recv text ({} bytes): {}", text.len(), &text[..text.len().min(300)]);
+                    // Log every raw text frame for protocol debugging. Gated
+                    // behind debug_protocol because this fires on every frame
+                    // of every active stream and floods log sinks (e.g. the
+                    // Railway 500 logs/sec rate limit).
+                    if debug_protocol {
+                        debug!(
+                            "WS recv text ({} bytes): {}",
+                            text.len(),
+                            &text[..text.len().min(300)]
+                        );
+                    }
                     if let Ok(val) = serde_json::from_str::<Value>(&text) {
                         if let Some(chunk) = val.get("chunk") {
                             if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
@@ -1540,7 +1565,9 @@ pub async fn stream_completion(
                         }
                     }
                 } else if let Message::Close(frame) = msg {
-                    debug!("WS close frame received: {:?}", frame);
+                    if debug_protocol {
+                        debug!("WS close frame received: {:?}", frame);
+                    }
                     break;
                 }
             }
