@@ -24,6 +24,9 @@
 !config.toml
 !config/**
 
+# Keep deployment build config
+!nixpacks.toml
+
 # Keep bundled Tor files, but not runtime Tor data
 !tor/**
 
