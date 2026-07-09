@@ -1,6 +1,6 @@
 [toolchain]
-# hashbrown 0.17.1 (a transitive dependency in Cargo.lock) requires the
-# edition2024 Cargo feature, which is only available in Rust 1.85+. Pinning
-# the channel here ensures builders like Railpack install a compatible
-# toolchain instead of falling back to an older default (e.g. 1.84.0).
-channel = "1.85.0"
+# Transitive dependencies in Cargo.lock (cookie_store, time, home, icu_*
+# packages) require Rust 1.86-1.88. Pinning the channel here ensures
+# builders like Railpack install a compatible toolchain instead of falling
+# back to an older default that fails the build.
+channel = "1.88.0"
