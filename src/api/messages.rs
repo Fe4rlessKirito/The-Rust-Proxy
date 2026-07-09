@@ -2,6 +2,7 @@
 
 use axum::{
     extract::State,
+    http::StatusCode,
     response::{IntoResponse, Response, Sse},
     Json,
 };
@@ -368,6 +369,38 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let model_clone = model.clone();
 
+        // Open the upstream use.ai stream and peek its first item *before*
+        // committing the SSE 200. A fatal per-IP rate limit (no content
+        // emitted, not retried because use.ai binds the session to one Tor
+        // exit) must surface as a real HTTP 429 so the client retries with a
+        // fresh account/exit — otherwise we'd emit an empty completion that
+        // clients report as "model returned no content". Mid-stream rate
+        // limits (after content) are still ended cleanly inside the generators
+        // below.
+        let upstream = stream_completion(CompletionRequest {
+            model: model.clone(),
+            messages: openai_messages.clone(),
+            proxy_url: proxy_url.clone(),
+            account: account.clone(),
+        })
+        .await;
+        let stream = match crate::direct::peek_stream_start(upstream).await {
+            Ok(s) => s,
+            Err(_e) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "upstream use.ai rate limit; please retry",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         if tool_mode_expected {
             let sse_stream = async_stream::stream! {
                 let start_event = serde_json::json!({
@@ -402,12 +435,7 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
                 });
                 let mut text_block_open = false;
 
-                let mut stream = stream_completion(CompletionRequest {
-                    model: model.clone(),
-                    messages: openai_messages.clone(),
-                    proxy_url: proxy_url.clone(),
-                    account: account.clone(),
-                }).await;
+                let mut stream = stream;
                 let mut tool_buffer = ToolModeStreamBuffer::default();
                 let mut stream_error = None;
                 while let Some(chunk) = stream.next().await {
@@ -589,12 +617,7 @@ async fn handler(State(pool): State<AccountPool>, Json(req): Json<AnthropicReque
             yield Ok(axum::response::sse::Event::default().data(block_start.to_string()));
 
             // 3. Stream text deltas, with thinking-aware splitting
-            let mut stream = stream_completion(CompletionRequest {
-                model: model.clone(),
-                messages: openai_messages.clone(),
-                proxy_url: proxy_url.clone(),
-                account: account.clone(),
-            }).await;
+            let mut stream = stream;
 
             // We'll use a state machine to split thinking and response
             let mut buffer = String::new();

@@ -295,6 +295,31 @@ pub fn is_stream_rate_limit_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<RateLimitError>().is_some()
 }
 
+/// Peeks the first item of a use.ai completion stream before the caller
+/// commits to an SSE 200 response. A stream that opens with a fatal
+/// rate-limit error (no content emitted, fail-fast because the same bound
+/// Tor exit can't be retried) is returned as `Err` so the caller can map it
+/// to a real HTTP 429 and let the client retry with a fresh account/exit —
+/// instead of yielding an empty `finish_reason: "stop"` completion that
+/// clients report as "model returned no content". Any other first item (Ok
+/// content, a non-rate-limit error, or an empty stream) is prepended back
+/// onto the stream and returned for normal consumption, preserving existing
+/// behavior.
+pub async fn peek_stream_start(
+    mut stream: BoxStream<'static, Result<String>>,
+) -> Result<BoxStream<'static, Result<String>>> {
+    let first = stream.next().await;
+    match first {
+        Some(Err(e)) if is_stream_rate_limit_error(&e) => Err(e),
+        Some(item) => {
+            let prepend = futures::stream::once(futures::future::ready(item));
+            Ok(Box::pin(prepend.chain(stream))
+                as BoxStream<'static, Result<String>>)
+        }
+        None => Ok(Box::pin(stream) as BoxStream<'static, Result<String>>),
+    }
+}
+
 fn build_client_with_jar(proxy_url: Option<&str>) -> Result<(Client, Arc<Jar>)> {
     let jar = Arc::new(Jar::default());
     let mut default_headers = reqwest::header::HeaderMap::new();
@@ -1415,6 +1440,18 @@ pub async fn stream_completion(
                         yield Err(err);
                         return;
                     }
+                    // A per-IP rate limit cannot be escaped by retrying: use.ai
+                    // binds the session to the account's signup Tor exit, so
+                    // every retry would hit the same IP that just rate-limited
+                    // us (only wasting the per-proxy cooldown). Propagate it
+                    // immediately so the caller returns a real error and the
+                    // client retries the whole request with a fresh account /
+                    // exit. Other pre-content errors still loop-and-retry.
+                    if is_stream_rate_limit_error(last_err.as_ref().unwrap()) {
+                        let err = last_err.unwrap();
+                        yield Err(err);
+                        return;
+                    }
                     // No content emitted yet: loop and retry with backoff.
                 }
                 None => return, // clean end of stream
@@ -1688,6 +1725,52 @@ fn summarize_frame_messages(frame: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peek_stream_start_surfaces_fatal_rate_limit_as_err() {
+        // A stream whose first item is a RateLimitError (no content emitted)
+        // must be surfaced as Err so callers return a real 429 instead of an
+        // empty "stop" completion.
+        let fatal: BoxStream<'static, Result<String>> = Box::pin(futures::stream::iter(
+            vec![Err(anyhow::Error::from(RateLimitError))],
+        ));
+        let result = peek_stream_start(fatal).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected fatal rate-limit error, got a stream"),
+        };
+        assert!(is_stream_rate_limit_error(&err));
+    }
+
+    #[tokio::test]
+    async fn peek_stream_start_prepends_content_and_keeps_stream() {
+        // A stream that opens with content must be returned intact with the
+        // peeked item prepended, so normal consumption is unchanged.
+        let s: BoxStream<'static, Result<String>> = Box::pin(futures::stream::iter(vec![
+            Ok("hello".to_string()),
+            Ok(" world".to_string()),
+        ]));
+        let mut stream = peek_stream_start(s).await.expect("content stream should be Ok");
+        let mut out = String::new();
+        while let Some(chunk) = stream.next().await {
+            out.push_str(&chunk.unwrap());
+        }
+        assert_eq!(out, "hello world");
+    }
+
+    #[tokio::test]
+    async fn peek_stream_start_passes_through_non_rate_limit_error() {
+        // A non-rate-limit first error is prepended back (not surfaced as Err)
+        // so existing [ERROR]-delta behavior for other failures is preserved.
+        let s: BoxStream<'static, Result<String>> = Box::pin(futures::stream::iter(vec![
+            Err(anyhow!("connection refused")),
+            Ok("after".to_string()),
+        ]));
+        let mut stream = peek_stream_start(s).await.expect("non-rate-limit err is not fatal");
+        let first = stream.next().await.unwrap();
+        assert!(first.is_err());
+        assert!(!is_stream_rate_limit_error(&first.unwrap_err()));
+    }
 
     #[test]
     fn backoff_grows_exponentially_and_caps_at_max() {

@@ -2,6 +2,7 @@
 
 use axum::{
     extract::State,
+    http::StatusCode,
     response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
@@ -198,6 +199,37 @@ async fn chat_handler(State(pool): State<AccountPool>, Json(req): Json<ChatReque
             .as_secs();
         let model_clone = model.clone();
 
+        // Open the upstream use.ai stream and peek its first item *before*
+        // committing the SSE 200. A fatal per-IP rate limit (no content
+        // emitted, not retried because use.ai binds the session to one Tor
+        // exit) must surface as a real HTTP 429 so the client retries with a
+        // fresh account/exit — otherwise we'd emit an empty
+        // `finish_reason: "stop"` completion that clients report as "model
+        // returned no content". Mid-stream rate limits (after content) are
+        // still ended cleanly inside the generator below.
+        let upstream = stream_completion(CompletionRequest {
+            model: model.clone(),
+            messages: messages.clone(),
+            proxy_url: proxy_url.clone(),
+            account: account.clone(),
+        })
+        .await;
+        let stream = match crate::direct::peek_stream_start(upstream).await {
+            Ok(s) => s,
+            Err(_e) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": "upstream use.ai rate limit; please retry",
+                            "type": "rate_limit_error",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         let sse_stream = async_stream::stream! {
             let _permit = permit;
 
@@ -216,12 +248,7 @@ async fn chat_handler(State(pool): State<AccountPool>, Json(req): Json<ChatReque
             });
             yield Ok::<_, Infallible>(Event::default().data(role_chunk.to_string()));
 
-            let mut stream = stream_completion(CompletionRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                proxy_url: proxy_url.clone(),
-                account: account.clone(),
-            }).await;
+            let mut stream = stream;
 
             let mut buffered_reply = String::new();
             let mut tool_buffer = ToolModeStreamBuffer::default();
