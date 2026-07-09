@@ -138,12 +138,35 @@ async fn main() -> Result<()> {
 }
 
 fn init_logging(cfg: &config::Config) {
-    let filter = std::env::var("LEECH_LOG")
+    let base = std::env::var("LEECH_LOG")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| cfg.logging.level.clone());
 
-    let filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Suppress the chattiest third-party crates regardless of the base level.
+    // The worst offender is `html5ever` (pulled in by `scraper`, used for
+    // Faceb account provisioning): it logs every parsed HTML token at DEBUG,
+    // which floods log sinks past rate limits (e.g. Railway's 500 logs/sec).
+    // `selectors` is the same story. The network crates are capped at `info`
+    // so their warnings/errors still surface while their debug noise does
+    // not. These target-specific directives override a bare level directive.
+    let filter_str = format!(
+        "{base},\
+         html5ever=off,\
+         html5ever::tree_builder=off,\
+         selectors=off,\
+         scraper=off,\
+         cookie_store=info,\
+         hyper=info,\
+         hyper_util=info,\
+         reqwest=info,\
+         h2=info,\
+         rustls=info,\
+         tungstenite=info,\
+         mio=info"
+    );
+
+    let filter = EnvFilter::try_new(&filter_str).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

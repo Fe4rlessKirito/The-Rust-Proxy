@@ -50,5 +50,5 @@ expose_tool_thinking = false
 levels = { low = 1024, medium = 5000, high = 16000, max = 32000 }
 
 [logging]
-level = "debug"
+level = "info"
 debug_protocol = false
