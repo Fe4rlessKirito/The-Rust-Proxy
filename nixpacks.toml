@@ -1,6 +1,8 @@
 [phases.setup]
-aptPkgs = ["tor", "ca-certificates"]
-nixPkgs = ["rustc", "cargo", "nodejs_20", "npm"]
+# tor is installed via nix (not apt) because Nixpacks carries nix packages
+# into the runtime image + PATH, whereas aptPkgs only live in the build stage.
+# find_tor_exe resolves it at runtime via `which("tor")`.
+nixPkgs = ["rustc", "cargo", "nodejs_20", "npm", "tor"]
 
 [phases.build]
 cmds = [
@@ -9,9 +11,7 @@ cmds = [
   "cargo build --release"
 ]
 
-# Install tor at startup with a guard: it's a fast no-op when tor is already
-# present (e.g. Dockerfile path), and installs on demand when Nixpacks left it
-# out of the runtime image. This makes the runtime tor availability independent
-# of which builder Railway picks.
+# Safety net: if tor somehow isn't on PATH at runtime, install it via apt
+# before starting. No-op when the nix-installed tor is already present.
 [start]
-cmd = "sh -c 'if ! command -v tor >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends tor ca-certificates; fi && LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} LEECH_TOR_DATA_ROOT=${LEECH_TOR_DATA_ROOT:-/data/tor} TOR_BIN=/usr/bin/tor ./target/release/leech-rs'"
+cmd = "sh -c 'if ! command -v tor >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends tor; fi && LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} LEECH_TOR_DATA_ROOT=${LEECH_TOR_DATA_ROOT:-/data/tor} ./target/release/leech-rs'"
