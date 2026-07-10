@@ -407,8 +407,32 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
         })?;
     if !resp.status().is_success() {
         let status = resp.status();
+        // Log key response headers so we can tell whether the 403 is a
+        // Cloudflare block (server: cloudflare, cf-ray, cf-mitigated) or
+        // use.ai's own backend rejecting the signup (no cf-* headers).
+        let server = resp
+            .headers()
+            .get("server")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?")
+            .to_string();
+        let cf_ray = resp
+            .headers()
+            .get("cf-ray")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let cf_mitigated = resp
+            .headers()
+            .get("cf-mitigated")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
         let text = resp.text().await.unwrap_or_default();
-        error!("email-login failed: {} - {}", status, text);
+        error!(
+            "email-login failed: {} - {} | server={} cf-ray={} cf-mitigated={}",
+            status, text, server, cf_ray, cf_mitigated
+        );
         anyhow::bail!("email-login failed: {} - {}", status, text);
     }
 
