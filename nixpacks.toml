@@ -9,5 +9,9 @@ cmds = [
   "cargo build --release"
 ]
 
+# Install tor at startup with a guard: it's a fast no-op when tor is already
+# present (e.g. Dockerfile path), and installs on demand when Nixpacks left it
+# out of the runtime image. This makes the runtime tor availability independent
+# of which builder Railway picks.
 [start]
-cmd = "sh -c 'LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} LEECH_TOR_DATA_ROOT=${LEECH_TOR_DATA_ROOT:-/data/tor} TOR_BIN=/usr/bin/tor ./target/release/leech-rs'"
+cmd = "sh -c 'if ! command -v tor >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends tor ca-certificates; fi && LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} LEECH_TOR_DATA_ROOT=${LEECH_TOR_DATA_ROOT:-/data/tor} TOR_BIN=/usr/bin/tor ./target/release/leech-rs'"
