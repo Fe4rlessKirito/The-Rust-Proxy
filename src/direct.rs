@@ -331,6 +331,39 @@ fn build_client_with_jar(proxy_url: Option<&str>) -> Result<(Client, Arc<Jar>)> 
         "Referer",
         tungstenite::http::HeaderValue::from_static("https://use.ai/"),
     );
+    // Full Chrome header set so use.ai's signup anti-bot check sees a browser
+    // rather than a bare reqwest client. Matches the USER_AGENT (Chrome 144).
+    default_headers.insert("Accept", tungstenite::http::HeaderValue::from_static("*/*"));
+    default_headers.insert(
+        "Accept-Language",
+        tungstenite::http::HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    default_headers.insert(
+        "sec-ch-ua",
+        tungstenite::http::HeaderValue::from_static(
+            "\"Google Chrome\";v=\"144\", \"Chromium\";v=\"144\", \"Not.A/Brand\";v=\"99\"",
+        ),
+    );
+    default_headers.insert(
+        "sec-ch-ua-mobile",
+        tungstenite::http::HeaderValue::from_static("?0"),
+    );
+    default_headers.insert(
+        "sec-ch-ua-platform",
+        tungstenite::http::HeaderValue::from_static("\"Windows\""),
+    );
+    default_headers.insert(
+        "sec-fetch-site",
+        tungstenite::http::HeaderValue::from_static("same-origin"),
+    );
+    default_headers.insert(
+        "sec-fetch-mode",
+        tungstenite::http::HeaderValue::from_static("cors"),
+    );
+    default_headers.insert(
+        "sec-fetch-dest",
+        tungstenite::http::HeaderValue::from_static("empty"),
+    );
     let client_builder = Client::builder()
         .timeout(Duration::from_secs(30))
         .cookie_provider(jar.clone())
@@ -352,6 +385,15 @@ async fn create_account_once(proxy_url: Option<&str>) -> Result<Account> {
     let email = gen_email();
     let cfg = Config::load().unwrap_or_default();
     let auth_base = cfg.direct.auth_base;
+
+    // 0. Seed the cookie jar with a GET to the use.ai root. A real browser
+    // loads the page before submitting signup, and use.ai may require a
+    // cookie/CSRF token set by this initial load before the email-login POST
+    // is accepted (otherwise it returns 403 "Access denied"). We don't care
+    // about the body — only the cookies the response sets on the jar.
+    if let Err(e) = client.get("https://use.ai/").send().await {
+        debug!("seed GET to use.ai failed (continuing): {}", e);
+    }
 
     // 1. email-login
     let resp = client
