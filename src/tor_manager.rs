@@ -376,6 +376,18 @@ fn find_tor_exe() -> Result<PathBuf> {
         return Ok(path);
     }
 
+    // Diagnostic: nothing resolved. Log exactly what we saw so we can tell
+    // whether tor is installed-but-not-on-PATH, TOR_BIN points nowhere, etc.
+    let tor_bin = std::env::var("TOR_BIN").unwrap_or_else(|_| "<unset>".to_string());
+    let which_tor = which::which("tor")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<none: {}>", e));
+    let path_env = std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_string());
+    warn!(
+        "tor resolution failed: TOR_BIN={}, which(tor)={}, PATH={}",
+        tor_bin, which_tor, path_env
+    );
+
     Err(anyhow!("tor binary not found in ./tor/, TOR_BIN, or PATH"))
 }
 
