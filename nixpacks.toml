@@ -1,4 +1,5 @@
 [phases.setup]
+aptPkgs = ["tor", "ca-certificates"]
 nixPkgs = ["rustc", "cargo", "nodejs_20", "npm"]
 
 [phases.build]
@@ -9,4 +10,4 @@ cmds = [
 ]
 
 [start]
-cmd = "sh -c 'LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} ./target/release/leech-rs'"
+cmd = "sh -c 'LEECH__SERVER__HOST=0.0.0.0 LEECH__SERVER__PORT=${PORT:-8000} LEECH_DATA_DIR=${LEECH_DATA_DIR:-/data/usage} LEECH_TOR_DATA_ROOT=${LEECH_TOR_DATA_ROOT:-/data/tor} TOR_BIN=/usr/bin/tor ./target/release/leech-rs'"

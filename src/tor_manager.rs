@@ -339,14 +339,14 @@ async fn tor_socks_reachable(host: &str, port: u16) -> bool {
 fn find_tor_exe() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("TOR_BIN") {
         let path = PathBuf::from(path);
-        if path.exists() {
+        if is_executable(&path) {
             return Ok(path);
         }
     }
 
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
-    let candidates = [
+    let mut candidates = vec![
         exe_dir.join("tor").join("tor.exe"),
         exe_dir.join("tor.exe"),
         exe_dir.join("tor").join("tor"),
@@ -356,9 +356,14 @@ fn find_tor_exe() -> Result<PathBuf> {
         PathBuf::from("tor.exe"),
         PathBuf::from("tor"),
     ];
+    // On non-Windows, a committed `tor/tor.exe` is a Windows PE binary that
+    // can't execute here (spawn fails with EACCES/ENOEXEC). Drop `.exe`
+    // candidates so they can't shadow a real system tor discovered below.
+    #[cfg(not(windows))]
+    candidates.retain(|c| c.extension().and_then(|e| e.to_str()) != Some("exe"));
 
     for candidate in candidates {
-        if candidate.exists() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
     }
@@ -372,6 +377,24 @@ fn find_tor_exe() -> Result<PathBuf> {
     }
 
     Err(anyhow!("tor binary not found in ./tor/, TOR_BIN, or PATH"))
+}
+
+/// True if `path` exists and is executable. On Unix this checks the execute
+/// bits, so a non-executable file (e.g. a Windows `tor.exe` committed as
+/// 100644) is rejected instead of being spawned and failing with EACCES. On
+/// Windows, existence is sufficient — the OS handles `.exe` execution.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.exists()
 }
 
 fn tor_data_root() -> PathBuf {
