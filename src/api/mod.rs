@@ -24,7 +24,6 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::account_pool::AccountPool;
 use crate::config::Config;
 use crate::load_monitor::LoadMonitor;
-use crate::tor_manager::TorManager;
 
 async fn record_request(
     Extension(load_monitor): Extension<LoadMonitor>,
@@ -46,7 +45,6 @@ async fn removed_config_handler() -> Response {
 pub fn create_routes(
     pool: AccountPool,
     load_monitor: LoadMonitor,
-    tor_manager: Arc<TorManager>,
     config: Config,
 ) -> Router {
     let dashboard_dir = std::path::PathBuf::from("frontend").join("dist");
@@ -66,7 +64,6 @@ pub fn create_routes(
         .fallback_service(dashboard_service)
         .layer(from_fn(record_request))
         .layer(Extension(load_monitor))
-        .layer(Extension(tor_manager))
         .layer(Extension(config))
         .with_state(pool)
 }
@@ -89,25 +86,14 @@ mod tests {
     use crate::account_pool::AccountPool;
     use crate::config::Config;
     use crate::load_monitor::LoadMonitor;
-    use crate::tor_manager::TorManager;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use std::sync::Arc;
     use tower::util::ServiceExt;
 
     async fn app() -> axum::Router {
-        let tor_manager = Arc::new(TorManager::new(9050));
-        let pool = AccountPool::new_with_proxies(
-            1,
-            std::time::Duration::from_secs(60),
-            tor_manager.clone(),
-            Vec::new(),
-            5,
-            10,
-        )
-        .await;
+        let pool = AccountPool::new(1, std::time::Duration::from_secs(60), 5, 10).await;
 
-        create_routes(pool, LoadMonitor::new(), tor_manager, Config::default())
+        create_routes(pool, LoadMonitor::new(), Config::default())
     }
 
     #[tokio::test]

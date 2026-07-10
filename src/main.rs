@@ -11,25 +11,18 @@ mod pool;
 mod provider_proxies;
 mod providers;
 mod sakana;
-mod scale_controller;
 mod temp_mail;
-mod tor_manager;
 mod usage;
 mod utils;
 
 use anyhow::Result;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use load_monitor::LoadMonitor;
-use scale_controller::ScaleController;
-use tor_manager::TorManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,79 +39,26 @@ async fn main() -> Result<()> {
     );
     log_startup_diagnostics(&cfg);
 
-    // The Railway runtime builder (mise-based) ignores our nixPkgs/aptPkgs and
-    // the start command is overridden, so tor may be absent entirely. Install
-    // it from inside the app before the TorManager tries to spawn — this runs
-    // regardless of builder or start-command. Requires the container to run as
-    // root on a Debian-based image (both true on Railway).
-    ensure_tor_available().await;
-
-    let tor_manager = Arc::new(TorManager::new(9050));
-
-    let initial_ports = configured_initial_tor_ports(&cfg);
-
-    for port in initial_ports {
-        match tor_manager.add_existing_or_spawn(port).await {
-            Ok(url) => info!("Registered initial Tor proxy: {}", url),
-            Err(e) => warn!("Failed to start Tor on port {}: {}", port, e),
-        }
-    }
-
-    let active_proxies = tor_manager.get_proxies().await;
-    provider_proxies::sync_active(&active_proxies, &cfg.provider_proxies).await;
-    let use_ai_proxies = provider_proxies::assigned("use_ai").await;
-    let faceb_proxies = provider_proxies::assigned("faceb").await;
-
-    if let Some(url) = &cfg.proxy.socks5_url {
-        if !url.is_empty() && tor_manager.get_proxies().await.is_empty() {
-            warn!(
-                "socks5_url fallback is configured but dynamic TorManager only manages Tor ports"
-            );
-        }
-    }
-
     let load_monitor = LoadMonitor::new();
 
-    let pool = account_pool::AccountPool::new_with_proxies(
+    // Direct-egress only — no Tor. The account pool provisions use.ai accounts
+    // via direct egress; Faceb warmup also runs direct with no proxies.
+    let pool = account_pool::AccountPool::new(
         cfg.account_pool.size,
         Duration::from_secs(cfg.account_pool.ttl_sec),
-        tor_manager.clone(),
-        use_ai_proxies,
         cfg.account_pool.refill_sec,
         cfg.account_pool.signup_delay_ms,
     )
     .await;
     pool.start().await;
-    providers::faceb::start_background_warmup(faceb_proxies).await;
-
-    let scale_controller = ScaleController::new(
-        tor_manager.clone(),
-        load_monitor.clone(),
-        pool.clone(),
-        cfg.account_pool.size,
-        cfg.proxy
-            .tor_instances
-            .max(1)
-            .min(cfg.provider_proxies.use_ai_ports.len().max(1)),
-        cfg.provider_proxies.use_ai_ports.len().max(1),
-        cfg.provider_proxies.use_ai_ports.clone(),
-        5.0,
-        1.0,
-        Duration::from_secs(30),
-    );
-    let scale_controller = Arc::new(scale_controller);
-    let scale_runner = scale_controller.clone();
-    let scale_handle = tokio::spawn(async move {
-        scale_runner.run().await;
-    });
+    providers::faceb::start_background_warmup(Vec::new()).await;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = api::create_routes(pool.clone(), load_monitor, tor_manager.clone(), cfg.clone())
-        .layer(cors);
+    let app = api::create_routes(pool.clone(), load_monitor, cfg.clone()).layer(cors);
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -134,14 +74,6 @@ async fn main() -> Result<()> {
 
     pool.stop().await;
     providers::faceb::stop_background_warmup().await;
-    scale_controller.stop();
-    if tokio::time::timeout(Duration::from_secs(6), scale_handle)
-        .await
-        .is_err()
-    {
-        warn!("Scale controller did not stop within timeout");
-    }
-    let _ = tor_manager.stop_all().await;
 
     Ok(())
 }
@@ -179,46 +111,6 @@ fn init_logging(cfg: &config::Config) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Ensure a tor binary is available before the TorManager spawns instances.
-/// If tor isn't resolvable via `TOR_BIN` or PATH, install it via apt-get.
-/// This is a fallback for runtimes that don't honor package declarations in
-/// nixpacks.toml (e.g. Railway's mise-based builder) — running it inside the
-/// app makes it independent of the builder and start command.
-async fn ensure_tor_available() {
-    let already_present = std::env::var("TOR_BIN")
-        .ok()
-        .filter(|p| !p.is_empty() && Path::new(p).exists())
-        .is_some()
-        || which::which("tor").is_ok();
-    if already_present {
-        return;
-    }
-
-    warn!("tor binary not found at startup; attempting apt-get install tor");
-    let result = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg("apt-get update && apt-get install -y --no-install-recommends tor ca-certificates")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await;
-
-    match result {
-        Ok(status) if status.success() => {
-            if which::which("tor").is_ok() {
-                info!("startup apt-get install tor succeeded; tor now on PATH");
-            } else {
-                warn!("apt-get install reported success but tor still not on PATH");
-            }
-        }
-        Ok(status) => warn!(
-            "startup apt-get install tor failed (exit {:?})",
-            status.code()
-        ),
-        Err(e) => warn!("startup apt-get install tor could not run: {}", e),
-    }
-}
-
 fn log_startup_diagnostics(cfg: &config::Config) {
     info!("Model endpoints:");
     info!("  POST /v1/chat/completions");
@@ -237,27 +129,9 @@ fn log_startup_diagnostics(cfg: &config::Config) {
         "Usage session keys: OpenAI=user, Anthropic=metadata.session_id|metadata.user_id, fallback=default"
     );
     info!(
-        "Tor config: ports={:?}, instances={}, server=http://{}:{}",
-        cfg.proxy.tor_ports, cfg.proxy.tor_instances, cfg.server.host, cfg.server.port
+        "Egress: direct only (no Tor), server=http://{}:{}",
+        cfg.server.host, cfg.server.port
     );
-}
-
-fn configured_initial_tor_ports(cfg: &config::Config) -> Vec<u16> {
-    let mut ports = Vec::new();
-    ports.extend(cfg.provider_proxies.use_ai_ports.iter().take(2).copied());
-    ports.extend(cfg.provider_proxies.sakana_ports.iter().take(1).copied());
-    ports.extend(cfg.provider_proxies.faceb_ports.iter().take(1).copied());
-    if ports.is_empty() {
-        ports.extend(cfg.proxy.tor_ports.iter().copied());
-    }
-    if ports.is_empty() {
-        ports.extend(
-            (0..cfg.proxy.tor_instances.max(1)).map(|idx| 9050u16.saturating_add(idx as u16)),
-        );
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
 }
 
 async fn shutdown_signal() {

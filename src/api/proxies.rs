@@ -1,32 +1,33 @@
-//! Dynamic proxy and load status endpoint.
+//! Proxy and load status endpoint.
+//!
+//! The gateway is direct-egress only (no Tor). `/proxies` still reports load
+//! and the configured provider route counts for dashboard compatibility, but
+//! there are no active SOCKS5 proxies to expose.
 
 use axum::{extract::Extension, response::Json, routing::get, Router};
 use serde_json::json;
-use std::sync::Arc;
 
 use crate::account_pool::AccountPool;
 use crate::config::{Config, ProviderProxyConfig};
 use crate::load_monitor::LoadMonitor;
-use crate::tor_manager::TorManager;
 
 pub fn routes() -> Router<AccountPool> {
     Router::new().route("/proxies", get(proxies_handler))
 }
 
 async fn proxies_handler(
-    Extension(tor_manager): Extension<Arc<TorManager>>,
     Extension(load_monitor): Extension<LoadMonitor>,
     Extension(config): Extension<Config>,
 ) -> Json<serde_json::Value> {
-    let proxies = tor_manager.get_proxies().await;
     let provider_assignments = crate::provider_proxies::assignments().await;
     let provider_configured_routes = configured_route_counts(&config.provider_proxies);
     let (window_requests, requests_per_second) = load_monitor.snapshot().await;
     let requests_per_minute = requests_per_second * 60.0;
 
     Json(json!({
-        "proxies": proxies,
-        "proxy_count": proxies.len(),
+        "proxies": Vec::<String>::new(),
+        "proxy_count": 0,
+        "egress": "direct",
         "provider_assignments": provider_assignments,
         "provider_configured_routes": provider_configured_routes,
         "load": {
