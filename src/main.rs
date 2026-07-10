@@ -19,6 +19,8 @@ mod utils;
 
 use anyhow::Result;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -43,6 +45,13 @@ async fn main() -> Result<()> {
         cfg.server.host, cfg.server.port
     );
     log_startup_diagnostics(&cfg);
+
+    // The Railway runtime builder (mise-based) ignores our nixPkgs/aptPkgs and
+    // the start command is overridden, so tor may be absent entirely. Install
+    // it from inside the app before the TorManager tries to spawn — this runs
+    // regardless of builder or start-command. Requires the container to run as
+    // root on a Debian-based image (both true on Railway).
+    ensure_tor_available().await;
 
     let tor_manager = Arc::new(TorManager::new(9050));
 
@@ -168,6 +177,46 @@ fn init_logging(cfg: &config::Config) {
 
     let filter = EnvFilter::try_new(&filter_str).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Ensure a tor binary is available before the TorManager spawns instances.
+/// If tor isn't resolvable via `TOR_BIN` or PATH, install it via apt-get.
+/// This is a fallback for runtimes that don't honor package declarations in
+/// nixpacks.toml (e.g. Railway's mise-based builder) — running it inside the
+/// app makes it independent of the builder and start command.
+async fn ensure_tor_available() {
+    let already_present = std::env::var("TOR_BIN")
+        .ok()
+        .filter(|p| !p.is_empty() && Path::new(p).exists())
+        .is_some()
+        || which::which("tor").is_ok();
+    if already_present {
+        return;
+    }
+
+    warn!("tor binary not found at startup; attempting apt-get install tor");
+    let result = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("apt-get update && apt-get install -y --no-install-recommends tor ca-certificates")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await;
+
+    match result {
+        Ok(status) if status.success() => {
+            if which::which("tor").is_ok() {
+                info!("startup apt-get install tor succeeded; tor now on PATH");
+            } else {
+                warn!("apt-get install reported success but tor still not on PATH");
+            }
+        }
+        Ok(status) => warn!(
+            "startup apt-get install tor failed (exit {:?})",
+            status.code()
+        ),
+        Err(e) => warn!("startup apt-get install tor could not run: {}", e),
+    }
 }
 
 fn log_startup_diagnostics(cfg: &config::Config) {
