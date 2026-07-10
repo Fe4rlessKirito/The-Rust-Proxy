@@ -118,11 +118,19 @@ impl AccountPool {
         let refill_handle = tokio::spawn(async move {
             while *pool.running.lock().await {
                 let proxies = pool.proxies().await;
-                let signup_targets = if proxies.is_empty() {
-                    vec![None]
-                } else {
-                    proxies.into_iter().map(Some).collect::<Vec<_>>()
-                };
+                // use.ai sits behind Cloudflare, which hard-blocks datacenter
+                // egress IPs (Railway/Oracle/etc.) with a 403 "you have been
+                // blocked". Signup must go through a Tor exit; never fall back
+                // to direct egress. If no use.ai Tor proxies are registered
+                // yet, wait for them rather than spamming doomed direct
+                // attempts that just noise up the logs.
+                if proxies.is_empty() {
+                    debug!("use.ai refill waiting: no Tor proxies registered yet");
+                    time::sleep(pool.refill_interval).await;
+                    continue;
+                }
+                let signup_targets: Vec<Option<String>> =
+                    proxies.into_iter().map(Some).collect();
 
                 let current_len = pool.inner.lock().await.len();
                 let pending = pool.pending_signups.load(Ordering::Relaxed);
@@ -134,9 +142,9 @@ impl AccountPool {
                         break;
                     }
 
-                    let proxy_key = proxy
-                        .clone()
-                        .unwrap_or_else(|| format!("direct-{}", now_secs()));
+                    // proxy is always Some here — direct egress is never used
+                    // for use.ai signup (Cloudflare blocks datacenter IPs).
+                    let proxy_key = proxy.clone().expect("non-empty proxy target");
                     {
                         let mut pending_proxies = pool.pending_proxies.lock().await;
                         if pending_proxies.contains(&proxy_key) {
@@ -203,8 +211,14 @@ impl AccountPool {
             }
         }
 
-        let proxy = self.next_proxy().await;
-        create_account(proxy.as_deref()).await
+        // No fresh warm account — provision one on demand. use.ai signup must
+        // go through a Tor exit (Cloudflare hard-blocks datacenter egress
+        // IPs), so refuse to fall back to direct egress when no Tor proxy is
+        // available instead of attempting a doomed direct signup.
+        let proxy = self.next_proxy().await.ok_or_else(|| {
+            anyhow::anyhow!("no use.ai Tor proxy available; cannot provision account")
+        })?;
+        create_account(Some(proxy.as_str())).await
     }
 
     pub async fn len(&self) -> usize {
